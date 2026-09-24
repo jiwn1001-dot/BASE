@@ -229,28 +229,4 @@ BASEBALL_PLAYERS = [
     ("류진욱", 38000, 55, 45, 55, 90, 70),
 ]
 
-# 만약 1군 전체 명단 크기(KBO 280, K리그 360)에 맞게 뻥튀기가 필요하다면 자동 복제 (시뮬레이션 구색용)
-def expand_roster():
-    global SOCCER_PLAYERS, BASEBALL_PLAYERS
-    
-    # K리그 축구 360명 맞추기 (모자란 인원은 스탯을 약간 너프하여 무명1군으로 채움)
-    base_soccer = SOCCER_PLAYERS.copy()
-    needed_soccer = 360 - len(base_soccer)
-    for i in range(needed_soccer):
-        ref = random.choice(base_soccer)
-        new_name = f"무명선수(K리그){i+1}"
-        new_fee = int(ref[1] * random.uniform(0.3, 0.7))
-        new_stats = [max(1, int(s * random.uniform(0.7, 0.9))) for s in ref[2:]]
-        SOCCER_PLAYERS.append((new_name, new_fee, *new_stats))
-        
-    # KBO 야구 280명 맞추기
-    base_baseball = BASEBALL_PLAYERS.copy()
-    needed_baseball = 280 - len(base_baseball)
-    for i in range(needed_baseball):
-        ref = random.choice(base_baseball)
-        new_name = f"무명선수(KBO){i+1}"
-        new_fee = int(ref[1] * random.uniform(0.3, 0.7))
-        new_stats = [max(1, int(s * random.uniform(0.7, 0.9))) for s in ref[2:]]
-        BASEBALL_PLAYERS.append((new_name, new_fee, *new_stats))
-
-expand_roster()
+# 무명 선수 복제 로직 삭제 완료 (오직 실명 주전 선수만 등장)

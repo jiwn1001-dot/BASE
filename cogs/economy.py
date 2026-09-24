@@ -588,6 +588,34 @@ class EconomyCog(commands.Cog):
                     f"{r['current_price']:,} → {new_price:,}원 "
                     f"({pct:+.1f}%)"
                 )
+
+            # ── 선수 연봉(몸값) 차감 로직 ──
+            cur = await db.execute("SELECT cumulative_inflation FROM server_settings WHERE id = 1")
+            row = await cur.fetchone()
+            inf = row["cumulative_inflation"] if row else 1.0
+
+            cur = await db.execute('''
+                SELECT st.owner_id, sum(sp.base_transfer_fee) as total_cost
+                FROM soccer_players sp
+                JOIN sports_teams st ON sp.team_name = st.team_name
+                WHERE sp.team_name != '무소속'
+                GROUP BY st.owner_id
+            ''')
+            for owner in await cur.fetchall():
+                cost = int(owner["total_cost"] * inf)
+                await db.execute("UPDATE users SET money = money - ? WHERE user_id = ?", (cost, owner["owner_id"]))
+
+            cur = await db.execute('''
+                SELECT st.owner_id, sum(bp.base_transfer_fee) as total_cost
+                FROM baseball_players bp
+                JOIN sports_teams st ON bp.team_name = st.team_name
+                WHERE bp.team_name != '무소속'
+                GROUP BY st.owner_id
+            ''')
+            for owner in await cur.fetchall():
+                cost = int(owner["total_cost"] * inf)
+                await db.execute("UPDATE users SET money = money - ? WHERE user_id = ?", (cost, owner["owner_id"]))
+
             await db.commit()
 
         # 주가 변동 결과를 경제 관련 채널에 보낼 수 있으면 좋지만,
