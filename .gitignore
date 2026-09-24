@@ -1,0 +1,4 @@
+.env
+nation.db
+__pycache__/
+*.pyc
