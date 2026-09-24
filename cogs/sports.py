@@ -402,6 +402,60 @@ class SportsCog(commands.Cog):
         await interaction.response.send_message(embed=embed)
 
     # ═════════════════════════════════════════════════════════
+    #  기본 선수 자동 세팅 (관리자)
+    # ═════════════════════════════════════════════════════════
+    @app_commands.command(name="기본선수세팅", description="유명 축구/야구 선수를 무소속으로 자동 등록합니다 (관리자)")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def seed_default_players(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+        
+        try:
+            from .player_data import SOCCER_PLAYERS, BASEBALL_PLAYERS
+        except ImportError:
+            return await interaction.followup.send("❌ `player_data.py` 파일을 찾을 수 없습니다.")
+
+        added_soccer = 0
+        added_baseball = 0
+
+        async with aiosqlite.connect(self.db) as db:
+            # 축구 선수 추가
+            for p in SOCCER_PLAYERS:
+                name, fee, p1, p2, p3, p4, p5, p6 = p
+                cur = await db.execute("SELECT player_name FROM soccer_players WHERE player_name = ?", (name,))
+                if not await cur.fetchone():
+                    await db.execute(
+                        """INSERT INTO soccer_players
+                           (player_name, team_name, base_transfer_fee, pace, shooting, passing, dribbling, defending, physical)
+                           VALUES (?, '무소속', ?, ?, ?, ?, ?, ?, ?)""",
+                        (name, fee, p1, p2, p3, p4, p5, p6)
+                    )
+                    added_soccer += 1
+            
+            # 야구 선수 추가
+            for p in BASEBALL_PLAYERS:
+                name, fee, p1, p2, p3, p4, p5 = p
+                cur = await db.execute("SELECT player_name FROM baseball_players WHERE player_name = ?", (name,))
+                if not await cur.fetchone():
+                    await db.execute(
+                        """INSERT INTO baseball_players
+                           (player_name, team_name, base_transfer_fee, contact, power, run, arm, field)
+                           VALUES (?, '무소속', ?, ?, ?, ?, ?, ?)""",
+                        (name, fee, p1, p2, p3, p4, p5)
+                    )
+                    added_baseball += 1
+
+            await db.commit()
+
+        embed = discord.Embed(
+            title="✅ 기본 선수 세팅 완료",
+            description="DB에 존재하지 않던 선수들만 새로 등록되었습니다.",
+            colour=0x3498DB
+        )
+        embed.add_field(name="⚽ 축구 추가됨", value=f"{added_soccer}명", inline=True)
+        embed.add_field(name="⚾ 야구 추가됨", value=f"{added_baseball}명", inline=True)
+        await interaction.followup.send(embed=embed)
+
+    # ═════════════════════════════════════════════════════════
     #  시즌 생성
     # ═════════════════════════════════════════════════════════
     async def generate_season(self):
