@@ -158,6 +158,81 @@ class PoliticsCog(commands.Cog):
         await interaction.response.send_message(embed=embed)
 
     # ═════════════════════════════════════════════════════════
+    #  정당 삭제 (관리자)
+    # ═════════════════════════════════════════════════════════
+    @app_commands.command(name="정당삭제", description="정당을 삭제합니다 (관리자)")
+    @app_commands.describe(정당명="삭제할 정당 이름")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def delete_party(self, interaction: discord.Interaction, 정당명: str):
+        async with aiosqlite.connect(self.db) as db:
+            cur = await db.execute("SELECT party_name FROM parties WHERE party_name = ?", (정당명,))
+            if not await cur.fetchone():
+                return await interaction.response.send_message("❌ 해당 정당이 존재하지 않습니다.", ephemeral=True)
+            
+            await db.execute("DELETE FROM parties WHERE party_name = ?", (정당명,))
+            await db.commit()
+
+        embed = discord.Embed(
+            title="🗑️ 정당 삭제 완료",
+            description=f"**{정당명}**이(가) 해산되었습니다.",
+            colour=0xE74C3C,
+        )
+        await interaction.response.send_message(embed=embed)
+
+    # ═════════════════════════════════════════════════════════
+    #  의석 수정 (관리자)
+    # ═════════════════════════════════════════════════════════
+    @app_commands.command(name="의석수정", description="정당의 의석 수를 수정합니다 (관리자)")
+    @app_commands.describe(정당명="대상 정당", 하원의석="새로운 하원 의석 수", 상원의석="새로운 상원 의석 수")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def modify_seats(self, interaction: discord.Interaction, 정당명: str, 하원의석: int, 상원의석: int):
+        async with aiosqlite.connect(self.db) as db:
+            cur = await db.execute("SELECT party_name FROM parties WHERE party_name = ?", (정당명,))
+            if not await cur.fetchone():
+                return await interaction.response.send_message("❌ 해당 정당이 존재하지 않습니다.", ephemeral=True)
+            
+            await db.execute(
+                "UPDATE parties SET house_seats = ?, senate_seats = ? WHERE party_name = ?",
+                (하원의석, 상원의석, 정당명)
+            )
+            await db.commit()
+
+        embed = discord.Embed(
+            title="🔄 의석 수정 완료",
+            description=f"**{정당명}**의 의석이 수정되었습니다.",
+            colour=0x3498DB,
+        )
+        embed.add_field(name="🏠 하원 의석", value=f"{하원의석}석", inline=True)
+        embed.add_field(name="🏢 상원 의석", value=f"{상원의석}석", inline=True)
+        await interaction.response.send_message(embed=embed)
+
+    # ═════════════════════════════════════════════════════════
+    #  정당 이름 수정 (관리자)
+    # ═════════════════════════════════════════════════════════
+    @app_commands.command(name="정당이름수정", description="정당의 이름을 수정합니다 (관리자)")
+    @app_commands.describe(기존이름="현재 정당 이름", 새이름="새로운 정당 이름")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def modify_party_name(self, interaction: discord.Interaction, 기존이름: str, 새이름: str):
+        async with aiosqlite.connect(self.db) as db:
+            cur = await db.execute("SELECT party_name FROM parties WHERE party_name = ?", (기존이름,))
+            if not await cur.fetchone():
+                return await interaction.response.send_message("❌ 해당 정당이 존재하지 않습니다.", ephemeral=True)
+            
+            cur = await db.execute("SELECT party_name FROM parties WHERE party_name = ?", (새이름,))
+            if await cur.fetchone():
+                return await interaction.response.send_message("❌ 이미 존재하는 정당 이름입니다.", ephemeral=True)
+            
+            await db.execute("UPDATE parties SET party_name = ? WHERE party_name = ?", (새이름, 기존이름))
+            await db.commit()
+
+        embed = discord.Embed(
+            title="🏷️ 정당 이름 변경",
+            description=f"**{기존이름}**이(가) **{새이름}**(으)로 당명을 변경했습니다.",
+            colour=0x2ECC71,
+        )
+        await interaction.response.send_message(embed=embed)
+
+    # ═════════════════════════════════════════════════════════
     #  법안 발의
     # ═════════════════════════════════════════════════════════
     @app_commands.command(name="법안발의", description="법안을 발의하고 투표를 시작합니다")
