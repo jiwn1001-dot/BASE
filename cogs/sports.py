@@ -456,6 +456,33 @@ class SportsCog(commands.Cog):
         await interaction.followup.send(embed=embed)
 
     # ═════════════════════════════════════════════════════════
+    #  선수 데이터 전체 초기화 (관리자)
+    # ═════════════════════════════════════════════════════════
+    @app_commands.command(name="선수초기화", description="등록된 모든 선수 데이터를 삭제합니다 (관리자)")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def reset_all_players(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+
+        async with aiosqlite.connect(self.db) as db:
+            cur = await db.execute("SELECT COUNT(*) FROM soccer_players")
+            soccer_count = (await cur.fetchone())[0]
+            cur = await db.execute("SELECT COUNT(*) FROM baseball_players")
+            baseball_count = (await cur.fetchone())[0]
+
+            await db.execute("DELETE FROM soccer_players")
+            await db.execute("DELETE FROM baseball_players")
+            await db.commit()
+
+        embed = discord.Embed(
+            title="🗑️ 선수 데이터 초기화 완료",
+            description="모든 선수가 DB에서 삭제되었습니다.\n`/기본선수세팅`으로 다시 등록하세요.",
+            colour=0xE74C3C
+        )
+        embed.add_field(name="⚽ 삭제된 축구 선수", value=f"{soccer_count}명", inline=True)
+        embed.add_field(name="⚾ 삭제된 야구 선수", value=f"{baseball_count}명", inline=True)
+        await interaction.followup.send(embed=embed)
+
+    # ═════════════════════════════════════════════════════════
     #  시즌 생성
     # ═════════════════════════════════════════════════════════
     async def generate_season(self):
