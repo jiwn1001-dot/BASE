@@ -1002,6 +1002,149 @@ class SportsCog(commands.Cog):
         # ── 새 시즌 생성 ─────────────────────────────────
         await self.generate_season()
 
+    # ═════════════════════════════════════════════════════════
+    #  선수 검색 및 비교
+    # ═════════════════════════════════════════════════════════
+    @app_commands.command(name="선수검색", description="선수의 능력치와 현재 몸값을 조회합니다")
+    @app_commands.describe(종목="축구 또는 야구", 선수명="조회할 선수 이름")
+    @app_commands.choices(종목=[
+        app_commands.Choice(name="축구", value="축구"),
+        app_commands.Choice(name="야구", value="야구")
+    ])
+    async def search_player(self, interaction: discord.Interaction, 종목: app_commands.Choice[str], 선수명: str):
+        await interaction.response.defer()
+        
+        async with aiosqlite.connect(self.db) as db:
+            db.row_factory = aiosqlite.Row
+            # 인플레이션 적용된 가격 계산용
+            cur = await db.execute("SELECT cumulative_inflation FROM server_settings WHERE id = 1")
+            inf_row = await cur.fetchone()
+            inf = inf_row["cumulative_inflation"] if inf_row else 1.0
+
+            if 종목.value == "축구":
+                cur = await db.execute("SELECT * FROM soccer_players WHERE player_name = ?", (선수명,))
+                row = await cur.fetchone()
+                if not row:
+                    return await interaction.followup.send(f"❌ '{선수명}' 선수를 찾을 수 없습니다.")
+                
+                value = int(row['base_transfer_fee'] * inf)
+                embed = discord.Embed(title=f"⚽ {row['player_name']} (소속: {row['team_name']})", colour=0x3498DB)
+                embed.add_field(name="현재 가치(몸값)", value=f"**{value:,}원**", inline=False)
+                embed.add_field(name="스피드", value=row['pace'], inline=True)
+                embed.add_field(name="슈팅", value=row['shooting'], inline=True)
+                embed.add_field(name="패스", value=row['passing'], inline=True)
+                embed.add_field(name="드리블", value=row['dribbling'], inline=True)
+                embed.add_field(name="수비", value=row['defending'], inline=True)
+                embed.add_field(name="피지컬", value=row['physical'], inline=True)
+                await interaction.followup.send(embed=embed)
+
+            else:
+                cur = await db.execute("SELECT * FROM baseball_players WHERE player_name = ?", (선수명,))
+                row = await cur.fetchone()
+                if not row:
+                    return await interaction.followup.send(f"❌ '{선수명}' 선수를 찾을 수 없습니다.")
+                
+                value = int(row['base_transfer_fee'] * inf)
+                embed = discord.Embed(title=f"⚾ {row['player_name']} (소속: {row['team_name']})", colour=0xE74C3C)
+                embed.add_field(name="현재 가치(몸값)", value=f"**{value:,}원**", inline=False)
+                embed.add_field(name="컨택트", value=row['contact'], inline=True)
+                embed.add_field(name="파워", value=row['power'], inline=True)
+                embed.add_field(name="주루", value=row['run'], inline=True)
+                embed.add_field(name="송구", value=row['arm'], inline=True)
+                embed.add_field(name="수비", value=row['field'], inline=True)
+                await interaction.followup.send(embed=embed)
+
+    @app_commands.command(name="선수비교", description="두 선수의 스탯을 비교합니다")
+    @app_commands.describe(종목="축구 또는 야구", 선수1="비교할 선수 1", 선수2="비교할 선수 2")
+    @app_commands.choices(종목=[
+        app_commands.Choice(name="축구", value="축구"),
+        app_commands.Choice(name="야구", value="야구")
+    ])
+    async def compare_players(self, interaction: discord.Interaction, 종목: app_commands.Choice[str], 선수1: str, 선수2: str):
+        await interaction.response.defer()
+        
+        async with aiosqlite.connect(self.db) as db:
+            db.row_factory = aiosqlite.Row
+            if 종목.value == "축구":
+                cur = await db.execute("SELECT * FROM soccer_players WHERE player_name IN (?, ?)", (선수1, 선수2))
+                rows = await cur.fetchall()
+            else:
+                cur = await db.execute("SELECT * FROM baseball_players WHERE player_name IN (?, ?)", (선수1, 선수2))
+                rows = await cur.fetchall()
+
+        if len(rows) < 2:
+            return await interaction.followup.send("❌ 한 명 이상의 선수를 찾을 수 없습니다. 이름을 정확히 입력하세요.")
+        
+        p1 = rows[0]
+        p2 = rows[1]
+        # p1이 선수1이 되도록 정렬
+        if p1['player_name'] != 선수1:
+            p1, p2 = p2, p1
+
+        embed = discord.Embed(title=f"📊 {선수1} vs {선수2} 비교", colour=0x9B59B6)
+        
+        def compare(v1, v2):
+            if v1 > v2: return f"**{v1}** > {v2}"
+            elif v1 < v2: return f"{v1} < **{v2}**"
+            else: return f"{v1} = {v2}"
+
+        if 종목.value == "축구":
+            embed.add_field(name="스피드", value=compare(p1['pace'], p2['pace']), inline=False)
+            embed.add_field(name="슈팅", value=compare(p1['shooting'], p2['shooting']), inline=False)
+            embed.add_field(name="패스", value=compare(p1['passing'], p2['passing']), inline=False)
+            embed.add_field(name="드리블", value=compare(p1['dribbling'], p2['dribbling']), inline=False)
+            embed.add_field(name="수비", value=compare(p1['defending'], p2['defending']), inline=False)
+            embed.add_field(name="피지컬", value=compare(p1['physical'], p2['physical']), inline=False)
+        else:
+            embed.add_field(name="컨택트", value=compare(p1['contact'], p2['contact']), inline=False)
+            embed.add_field(name="파워", value=compare(p1['power'], p2['power']), inline=False)
+            embed.add_field(name="주루", value=compare(p1['run'], p2['run']), inline=False)
+            embed.add_field(name="송구", value=compare(p1['arm'], p2['arm']), inline=False)
+            embed.add_field(name="수비", value=compare(p1['field'], p2['field']), inline=False)
+
+        await interaction.followup.send(embed=embed)
+
+    # ═════════════════════════════════════════════════════════
+    #  리그 팀 순위 조회
+    # ═════════════════════════════════════════════════════════
+    @app_commands.command(name="리그순위", description="현재 시즌 리그 순위를 언제든지 조회합니다")
+    @app_commands.describe(종목="축구 또는 야구")
+    @app_commands.choices(종목=[
+        app_commands.Choice(name="축구", value="축구"),
+        app_commands.Choice(name="야구", value="야구")
+    ])
+    async def league_ranking(self, interaction: discord.Interaction, 종목: app_commands.Choice[str]):
+        await interaction.response.defer()
+        
+        async with aiosqlite.connect(self.db) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT * FROM sports_teams WHERE sport_type = ?", (종목.value,)
+            )
+            teams = await cur.fetchall()
+
+        if not teams:
+            return await interaction.followup.send(f"❌ {종목.value} 구단이 아직 창설되지 않았습니다.")
+
+        lines = []
+        if 종목.value == "축구":
+            sorted_teams = sorted(teams, key=lambda t: (t["points"], t["wins"]), reverse=True)
+            for i, t in enumerate(sorted_teams, 1):
+                total = t["wins"] + t["draws"] + t["losses"]
+                lines.append(f"**{i}위** {t['team_name']} — 승점 {t['points']}점 ({t['wins']}승 {t['draws']}무 {t['losses']}패) [{total}경기]")
+            embed = discord.Embed(title="⚽ K리그 현재 순위", description="\n".join(lines), colour=0x3498DB)
+        else:
+            def win_rate(t):
+                tot = t["wins"] + t["losses"]
+                return t["wins"] / tot if tot > 0 else 0
+            sorted_teams = sorted(teams, key=lambda t: (win_rate(t), t["wins"]), reverse=True)
+            for i, t in enumerate(sorted_teams, 1):
+                total = t["wins"] + t["losses"]
+                lines.append(f"**{i}위** {t['team_name']} — 승률 {win_rate(t):.3f} ({t['wins']}승 {t['losses']}패) [{total}경기]")
+            embed = discord.Embed(title="⚾ KBO 현재 순위", description="\n".join(lines), colour=0xF1C40F)
+
+        await interaction.followup.send(embed=embed)
+
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(SportsCog(bot))
