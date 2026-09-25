@@ -34,9 +34,11 @@ class EconomyCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.daily_turn.start()
+        self.hourly_stock.start()
 
     def cog_unload(self):
         self.daily_turn.cancel()
+        self.hourly_stock.cancel()
 
     # ── 헬퍼 ─────────────────────────────────────────────────
     @property
@@ -457,7 +459,7 @@ class EconomyCog(commands.Cog):
 
         async with aiosqlite.connect(self.db) as db:
             cur = await db.execute(
-                "SELECT current_price FROM stocks WHERE company_name = ?", (기업명,)
+                "SELECT current_price, total_shares FROM stocks WHERE company_name = ?", (기업명,)
             )
             stock = await cur.fetchone()
             if not stock:
@@ -466,6 +468,7 @@ class EconomyCog(commands.Cog):
                 )
 
             price = stock[0]
+            total_shares = stock[1]
             total_cost = price * 수량
 
             cur = await db.execute(
@@ -489,13 +492,22 @@ class EconomyCog(commands.Cog):
                    DO UPDATE SET quantity = quantity + ?""",
                 (uid, 기업명, 수량, 수량),
             )
+            
+            # 주가 상승 로직: 매수 비율(수량/총주식수)에 비례해 상승 (1% 매수 시 0.5% 상승)
+            price_increase_ratio = (수량 / total_shares) * 0.5
+            new_price = max(1, int(price * (1 + price_increase_ratio)))
+            await db.execute(
+                "UPDATE stocks SET current_price = ? WHERE company_name = ?", (new_price, 기업명)
+            )
+
             await db.commit()
 
         embed = discord.Embed(
             title="📈 매수 체결",
             description=(
                 f"**{기업명}** {수량:,}주 매수 완료\n"
-                f"체결 단가: {price:,}원 · 총액: {total_cost:,}원"
+                f"체결 단가: {price:,}원 · 총액: {total_cost:,}원\n"
+                f"*(매수 영향으로 주가가 {new_price:,}원으로 올랐습니다)*"
             ),
             colour=0xE74C3C,
         )
@@ -529,9 +541,11 @@ class EconomyCog(commands.Cog):
                 )
 
             cur = await db.execute(
-                "SELECT current_price FROM stocks WHERE company_name = ?", (기업명,)
+                "SELECT current_price, total_shares FROM stocks WHERE company_name = ?", (기업명,)
             )
-            price = (await cur.fetchone())[0]
+            stock = await cur.fetchone()
+            price = stock[0]
+            total_shares = stock[1]
             revenue = price * 수량
 
             await db.execute(
@@ -547,25 +561,33 @@ class EconomyCog(commands.Cog):
                 "DELETE FROM stock_holdings WHERE user_id = ? AND company_name = ? AND quantity <= 0",
                 (uid, 기업명),
             )
+            
+            # 주가 하락 로직: 매도 비율(수량/총주식수)에 비례해 하락 (1% 매도 시 0.5% 하락)
+            price_decrease_ratio = (수량 / total_shares) * 0.5
+            new_price = max(1, int(price * (1 - price_decrease_ratio)))
+            await db.execute(
+                "UPDATE stocks SET current_price = ? WHERE company_name = ?", (new_price, 기업명)
+            )
+
             await db.commit()
 
         embed = discord.Embed(
             title="📉 매도 체결",
             description=(
                 f"**{기업명}** {수량:,}주 매도 완료\n"
-                f"체결 단가: {price:,}원 · 수익: {revenue:,}원"
+                f"체결 단가: {price:,}원 · 수익: {revenue:,}원\n"
+                f"*(매도 영향으로 주가가 {new_price:,}원으로 떨어졌습니다)*"
             ),
             colour=0x2ECC71,
         )
         await interaction.response.send_message(embed=embed)
 
     # ═════════════════════════════════════════════════════════
-    #  턴 넘기기 (매일 00시 자동 실행)
+    #  매시간 주가 변동 (1시간 주기 자동 실행)
     # ═════════════════════════════════════════════════════════
-    @tasks.loop(time=time(hour=0, minute=0, tzinfo=timezone(timedelta(hours=9))))
-    async def daily_turn(self):
-        print("[ECONOMY] 00시 정각 — 경제 턴 자동 진행 및 스포츠 시즌 마감 시작")
-        changes: list[str] = []
+    @tasks.loop(hours=1)
+    async def hourly_stock(self):
+        print("[ECONOMY] 매시간 정각 — 주식 시장 변동 시작")
         async with aiosqlite.connect(self.db) as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute(
@@ -582,12 +604,20 @@ class EconomyCog(commands.Cog):
                     "UPDATE stocks SET current_price = ? WHERE company_name = ?",
                     (new_price, r["company_name"]),
                 )
-                arrow = "🔺" if pct >= 0 else "🔻"
-                changes.append(
-                    f"{arrow} **{r['company_name']}** "
-                    f"{r['current_price']:,} → {new_price:,}원 "
-                    f"({pct:+.1f}%)"
-                )
+            await db.commit()
+
+    @hourly_stock.before_loop
+    async def before_hourly_stock(self):
+        await self.bot.wait_until_ready()
+
+    # ═════════════════════════════════════════════════════════
+    #  턴 넘기기 (매일 00시 자동 실행)
+    # ═════════════════════════════════════════════════════════
+    @tasks.loop(time=time(hour=0, minute=0, tzinfo=timezone(timedelta(hours=9))))
+    async def daily_turn(self):
+        print("[ECONOMY] 00시 정각 — 연봉 차감 및 스포츠 시즌 마감 시작")
+        async with aiosqlite.connect(self.db) as db:
+            db.row_factory = aiosqlite.Row
 
             # ── 선수 연봉(몸값) 차감 로직 ──
             cur = await db.execute("SELECT cumulative_inflation FROM server_settings WHERE id = 1")
