@@ -56,6 +56,31 @@ class RPSystemCog(commands.Cog):
         await interaction.response.send_message(embed=embed)
 
     # ═════════════════════════════════════════════════════════
+    #  아이템 삭제 (관리자)
+    # ═════════════════════════════════════════════════════════
+    @app_commands.command(name="아이템삭제", description="아이템을 삭제합니다 (관리자)")
+    @app_commands.describe(아이템명="삭제할 아이템 이름")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def delete_item(self, interaction: discord.Interaction, 아이템명: str):
+        async with aiosqlite.connect(self.db) as db:
+            cur = await db.execute("SELECT item_id FROM items WHERE item_name = ?", (아이템명,))
+            row = await cur.fetchone()
+            if not row:
+                return await interaction.response.send_message("❌ 해당 아이템이 존재하지 않습니다.", ephemeral=True)
+            
+            item_id = row[0]
+            await db.execute("DELETE FROM items WHERE item_id = ?", (item_id,))
+            await db.execute("DELETE FROM inventory WHERE item_id = ?", (item_id,))
+            await db.commit()
+
+        embed = discord.Embed(
+            title="🗑️ 아이템 삭제 완료",
+            description=f"**{아이템명}**이(가) 상점과 유저 인벤토리에서 삭제되었습니다.",
+            colour=0xE74C3C,
+        )
+        await interaction.response.send_message(embed=embed)
+
+    # ═════════════════════════════════════════════════════════
     #  아이템 상점 (물가 반영)
     # ═════════════════════════════════════════════════════════
     @app_commands.command(name="아이템상점", description="현재 상점의 아이템 목록을 확인합니다")
@@ -472,6 +497,26 @@ class RPSystemCog(commands.Cog):
         embed.set_thumbnail(url=프로필이미지)
         embed.add_field(name="캐릭터 이름", value=이름, inline=True)
         embed.set_footer(text=f"Discord: {interaction.user.display_name}")
+        await interaction.response.send_message(embed=embed)
+
+    # ═════════════════════════════════════════════════════════
+    #  캐릭터 삭제 (관리자)
+    # ═════════════════════════════════════════════════════════
+    @app_commands.command(name="캐릭터삭제", description="유저의 RP 캐릭터를 삭제합니다 (관리자)")
+    @app_commands.describe(유저="캐릭터를 삭제할 유저")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def delete_character(self, interaction: discord.Interaction, 유저: discord.Member):
+        async with aiosqlite.connect(self.db) as db:
+            await db.execute(
+                "UPDATE users SET rp_name = NULL, profile_url = NULL WHERE user_id = ?", (유저.id,)
+            )
+            await db.commit()
+
+        embed = discord.Embed(
+            title="🗑️ 캐릭터 삭제 완료",
+            description=f"{유저.mention}님의 RP 캐릭터 프로필이 초기화되었습니다.",
+            colour=0xE74C3C,
+        )
         await interaction.response.send_message(embed=embed)
 
     # ═════════════════════════════════════════════════════════

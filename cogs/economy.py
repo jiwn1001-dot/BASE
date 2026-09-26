@@ -247,18 +247,21 @@ class EconomyCog(commands.Cog):
         await interaction.response.send_message(embed=embed)
 
     # ═════════════════════════════════════════════════════════
-    #  주식 상장 (유저 유상)
+    #  기업 배정 (관리자 전용)
     # ═════════════════════════════════════════════════════════
-    @app_commands.command(name="주식상장", description="자신의 기업을 상장합니다")
+    @app_commands.command(name="기업배정", description="유저에게 기업을 상장시켜 배정합니다 (관리자)")
     @app_commands.describe(
+        유저="기업을 배정받을 유저",
         기업명="기업 이름",
         섹터명="섹터 (에너지화학/소재/산업재/모빌리티/정보기술/금융 및 부동산/소비재/헬스케어/미디어 및 콘텐츠)",
         초기주가="1주당 초기 가격",
         발행주식수="총 발행 주식 수",
     )
-    async def ipo(
+    @app_commands.checks.has_permissions(administrator=True)
+    async def assign_company(
         self,
         interaction: discord.Interaction,
+        유저: discord.Member,
         기업명: str,
         섹터명: str,
         초기주가: int,
@@ -269,64 +272,57 @@ class EconomyCog(commands.Cog):
                 f"❌ 유효하지 않은 섹터입니다.\n허용 섹터: {', '.join(VALID_SECTORS)}",
                 ephemeral=True,
             )
-        uid = interaction.user.id
+        uid = 유저.id
         await self.bot.ensure_user(uid)
 
-        listing_fee = int(초기주가 * 발행주식수 * 0.05)
-
         async with aiosqlite.connect(self.db) as db:
-            # 중복 확인
-            cur = await db.execute(
-                "SELECT company_name FROM stocks WHERE company_name = ?", (기업명,)
-            )
+            cur = await db.execute("SELECT company_name FROM stocks WHERE company_name = ?", (기업명,))
             if await cur.fetchone():
-                return await interaction.response.send_message(
-                    "❌ 이미 같은 이름의 기업이 상장되어 있습니다.", ephemeral=True
-                )
+                return await interaction.response.send_message("❌ 이미 같은 이름의 기업이 존재합니다.", ephemeral=True)
 
-            # 잔액 확인
-            cur = await db.execute(
-                "SELECT money FROM users WHERE user_id = ?", (uid,)
-            )
-            row = await cur.fetchone()
-            if row[0] < listing_fee:
-                return await interaction.response.send_message(
-                    f"❌ 상장 비용 **{listing_fee:,}원**이 부족합니다. "
-                    f"(현재 잔액: {row[0]:,}원)",
-                    ephemeral=True,
-                )
-
-            # 비용 차감
             await db.execute(
-                "UPDATE users SET money = money - ? WHERE user_id = ?",
-                (listing_fee, uid),
-            )
-            # 주식 등록
-            await db.execute(
-                """INSERT INTO stocks
-                   (company_name, owner_id, sector_name, current_price, total_shares, economic_phase)
+                """INSERT INTO stocks (company_name, owner_id, sector_name, current_price, total_shares, economic_phase)
                    VALUES (?, ?, ?, ?, ?, 3)""",
                 (기업명, uid, 섹터명, 초기주가, 발행주식수),
             )
-            # 오너에게 전체 주식 할당
             await db.execute(
-                """INSERT OR REPLACE INTO stock_holdings
-                   (user_id, company_name, quantity) VALUES (?, ?, ?)""",
+                """INSERT OR REPLACE INTO stock_holdings (user_id, company_name, quantity) VALUES (?, ?, ?)""",
                 (uid, 기업명, 발행주식수),
             )
             await db.commit()
 
         market_cap = 초기주가 * 발행주식수
         embed = discord.Embed(
-            title="🔔 신규 상장!",
-            description=f"**{기업명}** 이(가) {섹터명} 섹터에 상장되었습니다!",
+            title="🔔 신규 기업 상장 및 배정!",
+            description=f"**{기업명}** 이(가) {섹터명} 섹터에 상장되어 {유저.mention}님에게 배정되었습니다!",
             colour=0xE67E22,
         )
         embed.add_field(name="초기 주가", value=f"{초기주가:,}원", inline=True)
         embed.add_field(name="발행 주식 수", value=f"{발행주식수:,}주", inline=True)
         embed.add_field(name="시가총액", value=f"{market_cap:,}원", inline=True)
-        embed.add_field(name="상장 비용 (5%)", value=f"{listing_fee:,}원", inline=True)
-        embed.set_footer(text=f"상장자: {interaction.user.display_name}")
+        await interaction.response.send_message(embed=embed)
+
+    # ═════════════════════════════════════════════════════════
+    #  기업 삭제 (관리자 전용)
+    # ═════════════════════════════════════════════════════════
+    @app_commands.command(name="기업삭제", description="기업을 시장에서 상장 폐지(삭제)합니다 (관리자)")
+    @app_commands.describe(기업명="삭제할 기업 이름")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def delete_company(self, interaction: discord.Interaction, 기업명: str):
+        async with aiosqlite.connect(self.db) as db:
+            cur = await db.execute("SELECT company_name FROM stocks WHERE company_name = ?", (기업명,))
+            if not await cur.fetchone():
+                return await interaction.response.send_message("❌ 해당 기업이 존재하지 않습니다.", ephemeral=True)
+            
+            await db.execute("DELETE FROM stocks WHERE company_name = ?", (기업명,))
+            await db.execute("DELETE FROM stock_holdings WHERE company_name = ?", (기업명,))
+            await db.commit()
+
+        embed = discord.Embed(
+            title="🗑️ 기업 상장 폐지 완료",
+            description=f"**{기업명}**이(가) 주식 시장에서 삭제되었습니다.",
+            colour=0xE74C3C,
+        )
         await interaction.response.send_message(embed=embed)
 
     # ═════════════════════════════════════════════════════════
