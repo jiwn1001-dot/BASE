@@ -439,6 +439,57 @@ class EconomyCog(commands.Cog):
         await interaction.response.send_message(embed=embed)
 
     # ═════════════════════════════════════════════════════════
+    #  주가 확인
+    # ═════════════════════════════════════════════════════════
+    @app_commands.command(name="주가확인", description="특정 기업이나 전체 주식 시장의 현재 주가를 확인합니다")
+    @app_commands.describe(기업명="확인할 기업 이름 (선택사항)")
+    async def check_price(self, interaction: discord.Interaction, 기업명: str = None):
+        async with aiosqlite.connect(self.db) as db:
+            db.row_factory = aiosqlite.Row
+            if 기업명:
+                cur = await db.execute(
+                    "SELECT * FROM stocks WHERE company_name = ?", (기업명,)
+                )
+                row = await cur.fetchone()
+                if not row:
+                    return await interaction.response.send_message("❌ 해당 기업이 존재하지 않습니다.", ephemeral=True)
+                
+                market_cap = row["current_price"] * row["total_shares"]
+                phase_emoji = {1: "⬇️ (불황)", 2: "📉 (회복기)", 3: "📊 (보통)", 4: "📈 (경기과열)", 5: "💥 (공황)"}
+                pe = phase_emoji.get(row["economic_phase"], "❓")
+                
+                embed = discord.Embed(
+                    title=f"🏢 {row['company_name']} 주가 정보",
+                    colour=0x3498DB,
+                )
+                embed.add_field(name="현재 주가", value=f"**{row['current_price']:,}원**", inline=True)
+                embed.add_field(name="시가총액", value=f"{market_cap:,}원", inline=True)
+                embed.add_field(name="발행 주식 수", value=f"{row['total_shares']:,}주", inline=True)
+                embed.add_field(name="섹터", value=row["sector_name"], inline=True)
+                embed.add_field(name="경기 상황", value=pe, inline=True)
+                await interaction.response.send_message(embed=embed)
+            else:
+                cur = await db.execute(
+                    "SELECT company_name, current_price, economic_phase FROM stocks ORDER BY current_price DESC"
+                )
+                rows = await cur.fetchall()
+                if not rows:
+                    return await interaction.response.send_message("📭 상장된 기업이 없습니다.", ephemeral=True)
+                
+                phase_emoji = {1: "⬇️", 2: "📉", 3: "📊", 4: "📈", 5: "💥"}
+                lines = []
+                for r in rows:
+                    pe = phase_emoji.get(r["economic_phase"], "❓")
+                    lines.append(f"**{r['company_name']}**: {r['current_price']:,}원 {pe}")
+                
+                embed = discord.Embed(
+                    title="📈 전체 주식 시장 현황",
+                    description="\n".join(lines),
+                    colour=0x3498DB,
+                )
+                await interaction.response.send_message(embed=embed)
+
+    # ═════════════════════════════════════════════════════════
     #  매수
     # ═════════════════════════════════════════════════════════
     @app_commands.command(name="매수", description="주식을 매수합니다")
