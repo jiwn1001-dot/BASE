@@ -733,10 +733,17 @@ class SportsCog(commands.Cog):
         return score_a, score_b, events
 
     # ═════════════════════════════════════════════════════════
-    #  야구 경기 시뮬레이션 (5툴 기반)
+    #  야구 경기 시뮬레이션 (정식 룰 반영)
     # ═════════════════════════════════════════════════════════
     async def simulate_baseball(self, team_a: str, team_b: str) -> tuple[int, int, list[str]]:
-        """5-tool 스탯 기반 야구 매치 시뮬레이션"""
+        """
+        정식 야구 룰 기반 시뮬레이션
+        - 9이닝제 (9회말 홈팀 리드 시 스킵)
+        - 동점 시 연장전 (최대 12회까지)
+        - 볼넷(사사구) 포함
+        - 희생플라이 포함
+        - team_a = 원정팀(선공), team_b = 홈팀(후공)
+        """
         async with aiosqlite.connect(self.db) as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute(
@@ -758,25 +765,49 @@ class SportsCog(commands.Cog):
 
         score_a, score_b = 0, 0
         events = []
+        batter_idx_a = 0  # 원정팀 타순
+        batter_idx_b = 0  # 홈팀 타순
 
         def team_defense_avg(players):
             return sum(p["arm"] + p["field"] for p in players) / (len(players) * 2)
 
-        def simulate_half_inning(batting_team, batting_players, fielding_players, inning, is_top):
-            """하프이닝 시뮬레이션. 반환: (득점, 이벤트 리스트)"""
-            nonlocal events
+        def simulate_half_inning(batting_players, fielding_players, inning, is_top, batter_idx):
+            """하프이닝 시뮬레이션. 반환: (득점, 이벤트 리스트, 다음 타자 인덱스)"""
             outs = 0
             bases = [False, False, False]  # 1루, 2루, 3루
             runs = 0
             half_label = "초" if is_top else "말"
             defense_avg = team_defense_avg(fielding_players)
-            batter_index = 0
+            local_events = []
 
             while outs < 3:
-                batter = batting_players[batter_index % len(batting_players)]
-                batter_index += 1
+                batter = batting_players[batter_idx % len(batting_players)]
+                batter_idx += 1
 
-                # 타격 판정: contact vs 수비
+                # === 볼넷(사사구) 판정 ===
+                # 투수 컨트롤 = 수비 평균으로 대체, 볼넷 확률 ~8-12%
+                walk_chance = 0.08 + (100 - defense_avg) / 1500
+                if random.random() < walk_chance:
+                    # 볼넷 → 타자 출루
+                    if bases[0] and bases[1] and bases[2]:
+                        # 만루 볼넷 → 밀어내기 1점
+                        runs += 1
+                        local_events.append(
+                            f"🚶 {inning}회{half_label} | **{batter['player_name']}** 볼넷! 만루에서 밀어내기 1점!"
+                        )
+                    else:
+                        # 일반 볼넷
+                        if bases[0] and bases[1]:
+                            bases[2] = True
+                        if bases[0]:
+                            bases[1] = True
+                        bases[0] = True
+                        local_events.append(
+                            f"🚶 {inning}회{half_label} | **{batter['player_name']}** 볼넷으로 출루."
+                        )
+                    continue
+
+                # === 타격 판정: contact vs 수비 ===
                 hit_chance = batter["contact"] / (batter["contact"] + defense_avg + 20)
                 roll = random.random()
 
@@ -785,8 +816,8 @@ class SportsCog(commands.Cog):
                     power_roll = random.random() * 100
                     power_factor = batter["power"]
 
-                    if power_factor > 80 and power_roll < power_factor * 0.12:
-                        # 홈런 판정
+                    if power_factor > 70 and power_roll < power_factor * 0.10:
+                        # ── 홈런 ──
                         runners_on = sum(1 for b in bases if b)
                         rbi = 1 + runners_on
                         runs += rbi
@@ -795,11 +826,11 @@ class SportsCog(commands.Cog):
                             template = random.choice(BASEBALL_HIT_TEXTS["만루홈런"])
                         else:
                             template = random.choice(BASEBALL_HIT_TEXTS["홈런"])
-                        events.append(template.format(
+                        local_events.append(template.format(
                             inning=f"{inning}회{half_label}", batter=batter["player_name"]
                         ))
-                    elif power_roll < power_factor * 0.25:
-                        # 2루타
+                    elif power_roll < power_factor * 0.22:
+                        # ── 2루타 ──
                         if bases[2]:
                             runs += 1
                         if bases[1]:
@@ -808,73 +839,138 @@ class SportsCog(commands.Cog):
                         bases[1] = True
                         bases[0] = False
                         template = random.choice(BASEBALL_HIT_TEXTS["2루타"])
-                        events.append(template.format(
+                        local_events.append(template.format(
                             inning=f"{inning}회{half_label}", batter=batter["player_name"]
                         ))
-                    elif power_roll < power_factor * 0.30:
-                        # 3루타
+                    elif power_roll < power_factor * 0.26:
+                        # ── 3루타 ──
                         scored = sum(1 for b in bases if b)
                         runs += scored
                         bases = [False, False, True]
                         template = random.choice(BASEBALL_HIT_TEXTS["3루타"])
-                        events.append(template.format(
+                        local_events.append(template.format(
                             inning=f"{inning}회{half_label}", batter=batter["player_name"]
                         ))
                     else:
-                        # 안타 (1루타)
+                        # ── 안타 (1루타) ──
                         if bases[2]:
                             runs += 1
                             bases[2] = False
-                        # 주자 진루
+                        # 주자 진루 (2루 → 3루)
                         if bases[1]:
-                            bases[2] = True
-                            bases[1] = False
+                            # 주루 능력에 따라 홈 터치 여부
+                            if batter["run"] > 60 and random.random() < 0.35:
+                                runs += 1
+                                bases[1] = False
+                            else:
+                                bases[2] = True
+                                bases[1] = False
                         if bases[0]:
                             bases[1] = True
                         bases[0] = True
                         template = random.choice(BASEBALL_HIT_TEXTS["안타"])
-                        events.append(template.format(
+                        local_events.append(template.format(
                             inning=f"{inning}회{half_label}", batter=batter["player_name"]
                         ))
 
-                    # 도루 시도 (run 스탯 기반)
-                    if bases[0] and batter["run"] > 65 and random.random() < batter["run"] / 300:
+                    # === 도루 시도 (run 스탯 기반) ===
+                    if bases[0] and not bases[1] and batter["run"] > 65 and random.random() < 0.15:
                         if random.random() < batter["run"] / (batter["run"] + defense_avg):
-                            # 도루 성공
-                            if not bases[1]:
-                                bases[1] = True
-                                bases[0] = False
-                                events.append(random.choice(BASEBALL_STEAL_TEXTS).format(
-                                    inning=f"{inning}회{half_label}",
-                                    runner=batter["player_name"]
-                                ))
+                            bases[1] = True
+                            bases[0] = False
+                            local_events.append(random.choice(BASEBALL_STEAL_TEXTS).format(
+                                inning=f"{inning}회{half_label}",
+                                runner=batter["player_name"]
+                            ))
                         else:
-                            # 도루 실패
                             outs += 1
                             bases[0] = False
-                            events.append(BASEBALL_STEAL_TEXTS[1].format(
+                            local_events.append(BASEBALL_STEAL_TEXTS[1].format(
                                 inning=f"{inning}회{half_label}",
                                 runner=batter["player_name"]
                             ))
                 else:
-                    # 아웃
-                    outs += 1
+                    # === 아웃 처리 ===
                     fielder = random.choice(fielding_players)
-                    template = random.choice(BASEBALL_OUT_TEXTS)
-                    events.append(template.format(
-                        inning=f"{inning}회{half_label}",
-                        batter=batter["player_name"],
-                        fielder=fielder["player_name"],
-                    ))
 
-            return runs
+                    # 희생플라이 판정: 아웃 1개 미만 + 3루 주자 있을 때
+                    if outs < 2 and bases[2] and random.random() < 0.35:
+                        outs += 1
+                        runs += 1
+                        bases[2] = False
+                        local_events.append(
+                            f"✈️ {inning}회{half_label} | **{batter['player_name']}** 희생플라이! "
+                            f"3루 주자 홈인! (타자 아웃)"
+                        )
+                    # 병살타 판정: 아웃 1개 미만 + 1루 주자 있을 때
+                    elif outs < 2 and bases[0] and random.random() < 0.20:
+                        outs += 2
+                        bases[0] = False
+                        local_events.append(
+                            f"⬇️⬇️ {inning}회{half_label} | **{batter['player_name']}** 병살타! "
+                            f"**{fielder['player_name']}**의 빠른 중계 플레이!"
+                        )
+                    else:
+                        outs += 1
+                        template = random.choice(BASEBALL_OUT_TEXTS)
+                        local_events.append(template.format(
+                            inning=f"{inning}회{half_label}",
+                            batter=batter["player_name"],
+                            fielder=fielder["player_name"],
+                        ))
 
-        # 9이닝 진행
+            return runs, local_events, batter_idx
+
+        # ═══ 정규 이닝 (1~9회) ═══
         for inning in range(1, 10):
-            # 상위 (team_a 공격)
-            score_a += simulate_half_inning(team_a, players_a, players_b, inning, True)
-            # 하위 (team_b 공격)
-            score_b += simulate_half_inning(team_b, players_b, players_a, inning, False)
+            # 상위 (team_a = 원정팀 공격)
+            runs, evts, batter_idx_a = simulate_half_inning(
+                players_a, players_b, inning, True, batter_idx_a
+            )
+            score_a += runs
+            events.extend(evts)
+
+            # 9회말: 홈팀(team_b)이 이미 이기고 있으면 스킵 (끝내기 불필요)
+            if inning == 9 and score_b > score_a:
+                events.append(f"🏁 9회말 스킵 — **{team_b}**(홈) {score_b}:{score_a} 리드로 경기 종료!")
+                break
+
+            # 하위 (team_b = 홈팀 공격)
+            runs, evts, batter_idx_b = simulate_half_inning(
+                players_b, players_a, inning, False, batter_idx_b
+            )
+            score_b += runs
+            events.extend(evts)
+
+            # 9회말 끝내기: 홈팀이 역전하면 즉시 종료
+            if inning == 9 and score_b > score_a:
+                events.append(f"🎉 끝내기 승리! **{team_b}**(홈)가 {score_b}:{score_a}로 승리!")
+                break
+
+        # ═══ 연장전 (10~12회, 동점일 경우) ═══
+        if score_a == score_b:
+            for inning in range(10, 13):
+                events.append(f"⏰ **연장 {inning}회 돌입!**")
+
+                runs, evts, batter_idx_a = simulate_half_inning(
+                    players_a, players_b, inning, True, batter_idx_a
+                )
+                score_a += runs
+                events.extend(evts)
+
+                runs, evts, batter_idx_b = simulate_half_inning(
+                    players_b, players_a, inning, False, batter_idx_b
+                )
+                score_b += runs
+                events.extend(evts)
+
+                # 연장 이닝 종료 후 점수 차이 나면 끝
+                if score_a != score_b:
+                    break
+
+            # 12회까지 동점이면 무승부 (KBO 규정)
+            if score_a == score_b:
+                events.append("🤝 12회까지 동점! KBO 규정에 따라 무승부 처리.")
 
         return score_a, score_b, events
 
@@ -925,7 +1021,7 @@ class SportsCog(commands.Cog):
                         (lose,),
                     )
             else:
-                # 무승부 (축구만 해당, 야구는 연장으로 무승부 없다고 가정)
+                # 무승부 — 축구: 승점 1점 / 야구: KBO 12회 무승부
                 if sport == "축구":
                     await db.execute(
                         "UPDATE sports_teams SET draws = draws + 1, points = points + 1 WHERE team_name = ?",
@@ -933,6 +1029,16 @@ class SportsCog(commands.Cog):
                     )
                     await db.execute(
                         "UPDATE sports_teams SET draws = draws + 1, points = points + 1 WHERE team_name = ?",
+                        (team_b,),
+                    )
+                else:
+                    # 야구 무승부 (12회 규정)
+                    await db.execute(
+                        "UPDATE sports_teams SET draws = draws + 1 WHERE team_name = ?",
+                        (team_a,),
+                    )
+                    await db.execute(
+                        "UPDATE sports_teams SET draws = draws + 1 WHERE team_name = ?",
                         (team_b,),
                     )
             await db.commit()
@@ -961,7 +1067,7 @@ class SportsCog(commands.Cog):
             return
 
         # 주요 이벤트만 선별 (최대 12개)
-        key_events = [e for e in events if any(k in e for k in ["⚽", "💥", "🔥", "🏏"])]
+        key_events = [e for e in events if any(k in e for k in ["⚽", "💥", "🔥", "🏏", "🎉", "⏰", "🏁", "✈️", "⬇️⬇️"])]
         if not key_events:
             key_events = events[:6]
         else:
@@ -981,7 +1087,7 @@ class SportsCog(commands.Cog):
         )
 
         if key_events:
-            # 이벤트를 2000자 이내로 제한
+            # 이벤트를 1024자 이내로 제한
             event_text = "\n".join(key_events)
             if len(event_text) > 1024:
                 event_text = "\n".join(key_events[:8])
@@ -991,11 +1097,11 @@ class SportsCog(commands.Cog):
         await channel.send(embed=embed)
 
     # ═════════════════════════════════════════════════════════
-    #  10분 루프 스케줄러
+    #  5분 루프 스케줄러 — 한 경기씩 중계
     # ═════════════════════════════════════════════════════════
-    @tasks.loop(minutes=10)
+    @tasks.loop(minutes=5)
     async def match_scheduler(self):
-        """10분마다 시즌 큐에서 경기를 소화하고 중계한다."""
+        """5분마다 경기 큐에서 딱 1경기만 꺼내서 중계한다."""
         if not self.season_active:
             return
 
@@ -1003,31 +1109,32 @@ class SportsCog(commands.Cog):
             self.season_active = False
             return
 
-        # 현재 시각 기준 남은 10분 턴 수 (하루 144턴)
-        now = datetime.now()
-        minutes_since_midnight = now.hour * 60 + now.minute
-        current_turn = minutes_since_midnight // 10
-        remaining_turns = max(1, 144 - current_turn)
-
         soccer_ch, baseball_ch = await self.get_channels()
 
-        # ── 축구 경기 소화 ──────────────────────────────
-        if self.soccer_queue:
-            games_this_turn = max(1, math.ceil(len(self.soccer_queue) / remaining_turns))
-            for _ in range(min(games_this_turn, len(self.soccer_queue))):
+        # 축구와 야구를 번갈아가며 1경기씩 진행
+        if self.soccer_queue and self.baseball_queue:
+            # 둘 다 남아있으면 번갈아 진행 (짝수 턴=축구, 홀수 턴=야구)
+            if len(self.soccer_queue) >= len(self.baseball_queue):
+                # 축구 경기 수가 더 많거나 같으면 축구 먼저
                 team_a, team_b = self.soccer_queue.pop(0)
                 score_a, score_b, events = await self.simulate_soccer(team_a, team_b)
                 await self.update_record(team_a, team_b, score_a, score_b, "축구")
                 await self.send_match_result(soccer_ch, "⚽", team_a, team_b, score_a, score_b, events)
-
-        # ── 야구 경기 소화 ──────────────────────────────
-        if self.baseball_queue:
-            games_this_turn = max(1, math.ceil(len(self.baseball_queue) / remaining_turns))
-            for _ in range(min(games_this_turn, len(self.baseball_queue))):
+            else:
                 team_a, team_b = self.baseball_queue.pop(0)
                 score_a, score_b, events = await self.simulate_baseball(team_a, team_b)
                 await self.update_record(team_a, team_b, score_a, score_b, "야구")
                 await self.send_match_result(baseball_ch, "⚾", team_a, team_b, score_a, score_b, events)
+        elif self.soccer_queue:
+            team_a, team_b = self.soccer_queue.pop(0)
+            score_a, score_b, events = await self.simulate_soccer(team_a, team_b)
+            await self.update_record(team_a, team_b, score_a, score_b, "축구")
+            await self.send_match_result(soccer_ch, "⚽", team_a, team_b, score_a, score_b, events)
+        elif self.baseball_queue:
+            team_a, team_b = self.baseball_queue.pop(0)
+            score_a, score_b, events = await self.simulate_baseball(team_a, team_b)
+            await self.update_record(team_a, team_b, score_a, score_b, "야구")
+            await self.send_match_result(baseball_ch, "⚾", team_a, team_b, score_a, score_b, events)
 
     @match_scheduler.before_loop
     async def before_scheduler(self):
