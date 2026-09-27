@@ -225,6 +225,41 @@ class SportsCog(commands.Cog):
         await interaction.response.send_message(embed=embed)
 
     # ═════════════════════════════════════════════════════════
+    #  구단 이름 수정 (관리자)
+    # ═════════════════════════════════════════════════════════
+    @app_commands.command(name="구단이름수정", description="스포츠 구단의 이름을 변경합니다 (관리자)")
+    @app_commands.describe(기존구단명="변경할 기존 구단 이름", 새구단명="새로운 구단 이름")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def rename_team(self, interaction: discord.Interaction, 기존구단명: str, 새구단명: str):
+        if 기존구단명 == "무소속" or 새구단명 == "무소속":
+            return await interaction.response.send_message("❌ '무소속' 이라는 이름은 사용할 수 없습니다.", ephemeral=True)
+
+        async with aiosqlite.connect(self.db) as db:
+            cur = await db.execute("SELECT sport_type FROM sports_teams WHERE team_name = ?", (기존구단명,))
+            row = await cur.fetchone()
+            if not row:
+                return await interaction.response.send_message("❌ 기존 구단이 존재하지 않습니다.", ephemeral=True)
+
+            cur = await db.execute("SELECT team_name FROM sports_teams WHERE team_name = ?", (새구단명,))
+            if await cur.fetchone():
+                return await interaction.response.send_message("❌ 새 구단 이름이 이미 존재합니다.", ephemeral=True)
+
+            # 구단 이름 변경
+            await db.execute("UPDATE sports_teams SET team_name = ? WHERE team_name = ?", (새구단명, 기존구단명))
+            
+            # 소속 선수들의 팀명도 함께 변경
+            await db.execute("UPDATE soccer_players SET team_name = ? WHERE team_name = ?", (새구단명, 기존구단명))
+            await db.execute("UPDATE baseball_players SET team_name = ? WHERE team_name = ?", (새구단명, 기존구단명))
+            await db.commit()
+
+        embed = discord.Embed(
+            title="✏️ 구단 이름 변경 완료",
+            description=f"구단 이름이 **{기존구단명}**에서 **{새구단명}**(으)로 성공적으로 변경되었습니다.\n소속 선수들의 정보도 함께 업데이트되었습니다.",
+            colour=0x3498DB,
+        )
+        await interaction.response.send_message(embed=embed)
+
+    # ═════════════════════════════════════════════════════════
     #  구단 삭제 (관리자)
     # ═════════════════════════════════════════════════════════
     @app_commands.command(name="구단삭제", description="스포츠 구단을 삭제합니다 (관리자)")
