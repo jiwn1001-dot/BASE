@@ -253,6 +253,27 @@ class SportsCog(commands.Cog):
         await interaction.response.send_message(embed=embed)
 
     # ═════════════════════════════════════════════════════════
+    #  시즌 강제 시작 (관리자)
+    # ═════════════════════════════════════════════════════════
+    @app_commands.command(name="시즌시작", description="경기 스케줄을 즉시 갱신하고 시즌을 시작합니다 (관리자)")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def force_start_season(self, interaction: discord.Interaction):
+        await self.generate_season()
+        total = len(self.soccer_queue) + len(self.baseball_queue)
+        
+        if total == 0:
+            return await interaction.response.send_message(
+                "❌ 경기를 생성할 수 없습니다. (각 종목당 최소 2개 이상의 구단이 필요합니다)", ephemeral=True
+            )
+            
+        embed = discord.Embed(
+            title="🏁 시즌 강제 시작 완료",
+            description=f"시즌 스케줄을 새롭게 짰습니다!\n**총 {total}경기**가 매칭되었으며, 이제부터 매 10분마다 자동으로 경기가 중계됩니다.",
+            colour=0x2ECC71
+        )
+        await interaction.response.send_message(embed=embed)
+
+    # ═════════════════════════════════════════════════════════
     #  선수 등록 (관리자)
     # ═════════════════════════════════════════════════════════
     @app_commands.command(name="선수등록", description="무소속 선수를 등록합니다 (관리자)")
