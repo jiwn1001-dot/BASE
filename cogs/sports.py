@@ -225,6 +225,34 @@ class SportsCog(commands.Cog):
         await interaction.response.send_message(embed=embed)
 
     # ═════════════════════════════════════════════════════════
+    #  구단 삭제 (관리자)
+    # ═════════════════════════════════════════════════════════
+    @app_commands.command(name="구단삭제", description="스포츠 구단을 삭제합니다 (관리자)")
+    @app_commands.describe(구단명="삭제할 구단 이름")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def delete_team(self, interaction: discord.Interaction, 구단명: str):
+        async with aiosqlite.connect(self.db) as db:
+            cur = await db.execute("SELECT sport_type FROM sports_teams WHERE team_name = ?", (구단명,))
+            row = await cur.fetchone()
+            if not row:
+                return await interaction.response.send_message("❌ 해당 구단이 존재하지 않습니다.", ephemeral=True)
+            
+            # 구단 삭제
+            await db.execute("DELETE FROM sports_teams WHERE team_name = ?", (구단명,))
+            
+            # 소속 선수들 무소속(FA) 처리
+            await db.execute("UPDATE soccer_players SET team_name = '무소속' WHERE team_name = ?", (구단명,))
+            await db.execute("UPDATE baseball_players SET team_name = '무소속' WHERE team_name = ?", (구단명,))
+            await db.commit()
+
+        embed = discord.Embed(
+            title="🗑️ 구단 해체 완료",
+            description=f"**{구단명}** 구단이 해체되었습니다. 소속 선수들은 모두 무소속(FA)으로 전환됩니다.",
+            colour=0xE74C3C,
+        )
+        await interaction.response.send_message(embed=embed)
+
+    # ═════════════════════════════════════════════════════════
     #  선수 등록 (관리자)
     # ═════════════════════════════════════════════════════════
     @app_commands.command(name="선수등록", description="무소속 선수를 등록합니다 (관리자)")
