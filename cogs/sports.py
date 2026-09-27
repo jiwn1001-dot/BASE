@@ -1134,13 +1134,13 @@ class SportsCog(commands.Cog):
     # ═════════════════════════════════════════════════════════
     #  선수 명단 조회  (페이지네이션)
     # ═════════════════════════════════════════════════════════
-    @app_commands.command(name="선수명단", description="등록된 선수 전체 목록을 조회합니다 (페이지별 10명)")
-    @app_commands.describe(종목="축구 또는 야구", 페이지="페이지 번호 (기본 1)")
+    @app_commands.command(name="선수명단", description="등록된 선수 목록을 조회합니다 (페이지별 10명)")
+    @app_commands.describe(종목="축구 또는 야구", 페이지="페이지 번호 (기본 1)", 팀명="특정 팀의 선수만 봅니다 (선택사항)")
     @app_commands.choices(종목=[
         app_commands.Choice(name="축구", value="축구"),
         app_commands.Choice(name="야구", value="야구")
     ])
-    async def player_list(self, interaction: discord.Interaction, 종목: app_commands.Choice[str], 페이지: int = 1):
+    async def player_list(self, interaction: discord.Interaction, 종목: app_commands.Choice[str], 페이지: int = 1, 팀명: str = None):
         await interaction.response.defer()
         PER_PAGE = 10
 
@@ -1152,15 +1152,22 @@ class SportsCog(commands.Cog):
             inf = inf_row["cumulative_inflation"] if inf_row else 1.0
 
             if 종목.value == "축구":
-                cur = await db.execute(
-                    "SELECT player_name, team_name, base_transfer_fee, pace, shooting, passing, dribbling, defending, physical "
-                    "FROM soccer_players ORDER BY base_transfer_fee DESC"
-                )
+                query = "SELECT player_name, team_name, base_transfer_fee, pace, shooting, passing, dribbling, defending, physical FROM soccer_players"
+                params = ()
+                if 팀명:
+                    query += " WHERE team_name = ?"
+                    params = (팀명,)
+                query += " ORDER BY CASE WHEN team_name = '무소속' THEN 1 ELSE 0 END, team_name ASC, base_transfer_fee DESC"
+                cur = await db.execute(query, params)
             else:
-                cur = await db.execute(
-                    "SELECT player_name, team_name, base_transfer_fee, contact, power, run, arm, field "
-                    "FROM baseball_players ORDER BY base_transfer_fee DESC"
-                )
+                query = "SELECT player_name, team_name, base_transfer_fee, contact, power, run, arm, field FROM baseball_players"
+                params = ()
+                if 팀명:
+                    query += " WHERE team_name = ?"
+                    params = (팀명,)
+                query += " ORDER BY CASE WHEN team_name = '무소속' THEN 1 ELSE 0 END, team_name ASC, base_transfer_fee DESC"
+                cur = await db.execute(query, params)
+                
             all_rows = await cur.fetchall()
 
         total = len(all_rows)
@@ -1173,21 +1180,22 @@ class SportsCog(commands.Cog):
         lines = []
         for i, r in enumerate(page_rows, start + 1):
             value = int(r["base_transfer_fee"] * inf)
-            team = r["team_name"] if r["team_name"] != "무소속" else "FA"
+            team = r["team_name"] if r["team_name"] != "무소속" else "FA(무소속)"
             if 종목.value == "축구":
                 overall = int((r["pace"] + r["shooting"] + r["passing"] + r["dribbling"] + r["defending"] + r["physical"]) / 6)
-                lines.append(f"`{i:>3}.` **{r['player_name']}** ({team}) — 💰{value:,}원 | OVR {overall}")
+                lines.append(f"`{i:>3}.` **{r['player_name']}** [{team}] — 💰{value:,}원 | OVR {overall}")
             else:
                 overall = int((r["contact"] + r["power"] + r["run"] + r["arm"] + r["field"]) / 5)
-                lines.append(f"`{i:>3}.` **{r['player_name']}** ({team}) — 💰{value:,}원 | OVR {overall}")
+                lines.append(f"`{i:>3}.` **{r['player_name']}** [{team}] — 💰{value:,}원 | OVR {overall}")
 
         emoji = "⚽" if 종목.value == "축구" else "⚾"
+        title_text = f"{emoji} {종목.value} {팀명 if 팀명 else '전체'} 선수 명단 (총 {total}명)"
         embed = discord.Embed(
-            title=f"{emoji} {종목.value} 선수 명단 (총 {total}명)",
-            description="\n".join(lines) if lines else "등록된 선수가 없습니다.",
+            title=title_text,
+            description="\n".join(lines) if lines else "해당 조건의 선수가 없습니다.",
             colour=0x3498DB if 종목.value == "축구" else 0xE74C3C
         )
-        embed.set_footer(text=f"📄 {page} / {max_page} 페이지  |  /선수명단 {종목.value} [페이지번호]")
+        embed.set_footer(text=f"📄 {page} / {max_page} 페이지")
         await interaction.followup.send(embed=embed)
 
     # ═════════════════════════════════════════════════════════
