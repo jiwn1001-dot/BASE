@@ -1,81 +1,150 @@
 """
 cogs/sports.py — 스포츠 시뮬레이션 시스템
-K리그(축구) · KBO(야구) 구단 관리 · 선수 이적 · 24시간 자동 중계
-10분 루프 스케줄러 / 시즌 큐 / 스탯 기반 텍스트 중계
+K리그(축구) · KBO(야구) 구단 관리 · 선수 이적 · 24시간 실시간 중계
+
+· 시즌 = 하루 (00시 턴 넘기기 → 다음 00시)
+· 등록된 팀 수에 맞춰 경기 수와 경기 간격을 자동 계산해 24시간을 채움
+· 경기 1개 = 5분 실시간 중계 (전광판 임베드가 계속 갱신 + 골/홈런 속보)
 """
 
-import discord
-from discord.ext import commands, tasks
-from discord import app_commands
-import aiosqlite
+import asyncio
 import random
 import math
-from datetime import datetime
+import time
+import traceback
+import unicodedata
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+
+import discord
+from discord.ext import commands
+from discord import app_commands
+import aiosqlite
+
+from ._match_engine import simulate_soccer, simulate_baseball, win_odds, baseball_team_profile
+from . import _config as cfg
+
+KST = timezone(timedelta(hours=9))
 
 # ─── 팀 수 제한 ──────────────────────────────────────────────
 MAX_SOCCER_TEAMS = 12
 MAX_BASEBALL_TEAMS = 10
 
-# ─── 축구 이벤트 텍스트 템플릿 ─────────────────────────────
-SOCCER_GOAL_TEXTS = [
-    "⚽ {minute}분 | **{player}**의 강력한 슛! 골망을 가릅니다! 🔥",
-    "⚽ {minute}분 | **{player}**의 환상적인 중거리 슛이 골대 구석으로!",
-    "⚽ {minute}분 | **{player}**, 수비를 제치고 침착한 마무리! 골!!",
-    "⚽ {minute}분 | **{player}**의 헤딩 골! 크로스를 정확히 맞추었습니다!",
-    "⚽ {minute}분 | **{player}**의 프리킥이 벽을 넘어 골인!",
-    "⚽ {minute}분 | **{player}**, 패스를 받아 원터치 골! 아름다운 팀워크!",
-]
+# ─── 중계/일정 설정 ─────────────────────────────────────────
+# 경기 길이·휴식·뜸 들이기는 /설정변경 으로 조절 (경기_중계시간초 등)
+PREVIEW_LEAD = 60            # 킥오프 60초 전 프리뷰
+EDIT_INTERVAL = 6            # 이벤트가 없을 때 전광판(시계) 갱신 주기
+MIN_EDIT_GAP = 2.0           # 연속 수정 최소 간격 (디스코드 레이트리밋 보호)
+LOG_LINES = 9                # 전광판에 보여줄 문자중계 줄 수
+FORM_GAMES = 5               # 기세 계산에 쓰는 최근 경기 수
 
-SOCCER_SAVE_TEXTS = [
-    "🧤 {minute}분 | **{player}**의 슛! {team_b} 골키퍼의 선방으로 막힙니다!",
-    "🧤 {minute}분 | **{player}**의 강슛이 크로스바를 강타!",
-    "🧤 {minute}분 | **{player}**의 슛, 아깝게 빗나갑니다!",
-]
 
-SOCCER_EVENT_TEXTS = [
-    "💨 {minute}분 | **{player}**의 빠른 드리블 돌파! 수비가 허를 찔렸습니다!",
-    "🌀 {minute}분 | **{player}**의 현란한 개인기로 상대를 농락합니다!",
-    "🎯 {minute}분 | **{player}**의 정교한 스루패스! 찬스 생성!",
-    "🛡️ {minute}분 | **{player}**의 완벽한 태클! 상대 공격을 차단!",
-    "🟨 {minute}분 | **{player}**에게 경고 카드가 주어집니다.",
-    "🚩 {minute}분 | {team} 코너킥 기회!",
-]
+def match_seconds():
+    return cfg.get("경기_중계시간초")
 
-# ─── 야구 이벤트 텍스트 템플릿 ─────────────────────────────
-BASEBALL_HIT_TEXTS = {
-    "안타": [
-        "🏏 {inning}회 | **{batter}**의 깔끔한 안타! 1루로 출루!",
-        "🏏 {inning}회 | **{batter}**, 타구가 야수 사이를 꿰뚫습니다! 안타!",
-    ],
-    "2루타": [
-        "🏏 {inning}회 | **{batter}**의 강렬한 2루타! 외야 사이로 빠집니다!",
-        "🏏 {inning}회 | **{batter}**, 펜스 앞에서 바운드! 2루타!",
-    ],
-    "3루타": [
-        "🏏 {inning}회 | **{batter}**의 통쾌한 3루타! 외야 깊숙이!",
-    ],
-    "홈런": [
-        "💥 {inning}회 | **{batter}**의 호쾌한 홈런! 담장을 넘겼습니다! 🎆",
-        "💥 {inning}회 | **{batter}**, 풀스윙! 공이 하늘 높이 날아갑니다! 홈런!!",
-        "💥 {inning}회 | **{batter}**의 역전 홈런! 관중석이 들썩입니다!",
-    ],
-    "만루홈런": [
-        "🔥 {inning}회 | **{batter}**의 만루홈런!!! 4점이 한꺼번에!! 🎇🎆",
-    ],
+
+def suspense():
+    return cfg.get("경기_뜸들이기초")
+
+SPORT_META = {
+    "축구": {"emoji": "⚽", "league": "K리그"},
+    "야구": {"emoji": "⚾", "league": "KBO"},
 }
 
-BASEBALL_OUT_TEXTS = [
-    "🙅 {inning}회 | **{batter}** 헛스윙 삼진! 배트를 던집니다.",
-    "🙅 {inning}회 | **{batter}** 루킹 삼진. 꼼짝없이 당했습니다.",
-    "🦅 {inning}회 | **{batter}**의 뜬공, **{fielder}**가 여유있게 잡아냅니다!",
-    "⬇️ {inning}회 | **{batter}** 땅볼 아웃! 내야수의 빠른 송구!",
-    "⬇️ {inning}회 | **{batter}** 병살타! 한 번에 두 아웃!",
-]
 
-BASEBALL_STEAL_TEXTS = [
-    "💨 {inning}회 | **{runner}**의 도루 성공! 빠른 발을 보여줍니다!",
-    "🚫 {inning}회 | **{runner}** 도루 실패! 포수의 정확한 송구에 아웃!",
-]
+@dataclass
+class Fixture:
+    sport: str
+    home: str
+    away: str
+    round: int
+    kickoff: float           # epoch seconds
+
+
+def round_robin(teams):
+    """서클 방식 라운드로빈 — 한 라운드에 모든 팀이 한 경기씩 (홀수면 한 팀 휴식)"""
+    ts = list(teams)
+    if len(ts) % 2:
+        ts.append(None)
+    n = len(ts)
+    rounds = []
+    for r in range(n - 1):
+        pairs = []
+        for i in range(n // 2):
+            a, b = ts[i], ts[n - 1 - i]
+            if a is None or b is None:
+                continue
+            pairs.append((a, b) if (r + i) % 2 == 0 else (b, a))
+        rounds.append(pairs)
+        ts = [ts[0], ts[-1]] + ts[1:-1]
+    return rounds
+
+
+def build_schedule(sport, teams, start, end):
+    """
+    [start, end) 구간을 경기로 채운다.
+    팀이 많으면 라운드로빈 1바퀴가 하루를 넘지 않게 자르고,
+    팀이 적으면 라운드로빈을 여러 바퀴(홈/원정 교대) 돌려 경기 간격을 목표 휴식 근처로 맞춘다.
+    킥오프는 구간 전체에 균등 분배 → 24시간 내내 쉬지 않고 경기가 이어짐.
+    """
+    n = len(teams)
+    window = end - start
+    if n < 2 or window <= 0:
+        return []
+    max_games = int(window // (match_seconds() + cfg.get("경기_최소휴식초")))
+    if max_games < 1:
+        return []
+    base = round_robin(random.sample(teams, n))
+    per_cycle = sum(len(r) for r in base)
+    target = max(1, int(window // (match_seconds() + max(cfg.get("경기_목표휴식초"), cfg.get("경기_최소휴식초")))))
+    cycles = max(1, round(target / per_cycle))
+    while cycles > 1 and cycles * per_cycle > max_games:
+        cycles -= 1
+
+    games = []
+    rnd = 0
+    for c in range(cycles):
+        for pairs in base:
+            rnd += 1
+            rp = [(b, a) if c % 2 else (a, b) for a, b in pairs]
+            random.shuffle(rp)
+            games += [(rnd, h, a) for h, a in rp]
+    games = games[:max_games]
+    slot = window / len(games)
+    return [Fixture(sport, h, a, r, start + i * slot) for i, (r, h, a) in enumerate(games)]
+
+
+def next_midnight_kst(now_ts: float) -> float:
+    now = datetime.fromtimestamp(now_ts, KST)
+    midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return midnight.timestamp()
+
+
+def _dw(s):
+    """고정폭 표시 너비 (한글 2칸)"""
+    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in s)
+
+
+def _pad(s, width):
+    out = ""
+    for c in s:
+        if _dw(out + c) > width:
+            break
+        out += c
+    return out + " " * (width - _dw(out))
+
+
+def _trim_log(lines, limit=1000):
+    lines = list(lines)
+    while lines and len("\n".join(lines)) > limit:
+        lines.pop(0)
+    return "\n".join(lines) or "​"
+
+
+def _odds_bar(p1, pd, p2, n1, n2, sport):
+    if sport == "축구":
+        return f"**{n1}** {p1 * 100:.0f}% · 무 {pd * 100:.0f}% · **{n2}** {p2 * 100:.0f}%"
+    return f"**{n1}** {p1 * 100:.0f}% · **{n2}** {p2 * 100:.0f}%"
 
 
 class SportsCog(commands.Cog):
@@ -83,19 +152,33 @@ class SportsCog(commands.Cog):
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        # 시즌 큐
-        self.soccer_queue: list[tuple[str, str]] = []
-        self.baseball_queue: list[tuple[str, str]] = []
-        self.season_active = False
-        # 10분 루프 시작
-        self.match_scheduler.start()
+        self.schedule: dict[str, list[Fixture]] = {"축구": [], "야구": []}
+        self.runners: dict[str, asyncio.Task] = {}
+        self.live: dict[str, Fixture | None] = {"축구": None, "야구": None}
+        self._boot_task: asyncio.Task | None = None
+        self.form: dict[str, list[str]] = {}      # 팀별 최근 결과 ['W','D','L', ...]
+        self.rotation: dict[str, int] = {}        # 야구 팀별 다음 선발 순번
 
-    def cog_unload(self):
-        self.match_scheduler.cancel()
+    async def cog_load(self):
+        await cfg.load(self.db)
+        self._boot_task = asyncio.create_task(self._boot())
+
+    async def _boot(self):
+        await self.bot.wait_until_ready()
+        await self.start_season()
+
+    async def cog_unload(self):
+        if self._boot_task:
+            self._boot_task.cancel()
+        await self.stop_runners()
 
     @property
     def db(self):
         return self.bot.db_path
+
+    @property
+    def season_active(self):
+        return any(not t.done() for t in self.runners.values())
 
     # ═════════════════════════════════════════════════════════
     #  채널 설정
@@ -252,6 +335,13 @@ class SportsCog(commands.Cog):
             await db.execute("UPDATE baseball_players SET team_name = ? WHERE team_name = ?", (새구단명, 기존구단명))
             await db.commit()
 
+        # 오늘 남은 경기 일정에도 새 이름 반영
+        for fx in self.schedule.get(row[0], []):
+            if fx.home == 기존구단명:
+                fx.home = 새구단명
+            if fx.away == 기존구단명:
+                fx.away = 새구단명
+
         embed = discord.Embed(
             title="✏️ 구단 이름 변경 완료",
             description=f"구단 이름이 **{기존구단명}**에서 **{새구단명}**(으)로 성공적으로 변경되었습니다.\n소속 선수들의 정보도 함께 업데이트되었습니다.",
@@ -290,23 +380,61 @@ class SportsCog(commands.Cog):
     # ═════════════════════════════════════════════════════════
     #  시즌 강제 시작 (관리자)
     # ═════════════════════════════════════════════════════════
-    @app_commands.command(name="시즌시작", description="경기 스케줄을 즉시 갱신하고 시즌을 시작합니다 (관리자)")
+    @app_commands.command(name="시즌시작", description="오늘 남은 시간에 맞춰 경기 일정을 다시 짜고 중계를 시작합니다 (관리자)")
     @app_commands.checks.has_permissions(administrator=True)
     async def force_start_season(self, interaction: discord.Interaction):
-        await self.generate_season()
-        total = len(self.soccer_queue) + len(self.baseball_queue)
-        
+        await interaction.response.defer()
+        await self.start_season()
+        total = sum(len(v) for v in self.schedule.values())
+
         if total == 0:
-            return await interaction.response.send_message(
-                "❌ 경기를 생성할 수 없습니다. (각 종목당 최소 2개 이상의 구단이 필요합니다)", ephemeral=True
+            return await interaction.followup.send(
+                "❌ 경기를 생성할 수 없습니다. (종목당 구단 2개 이상 필요, 또는 자정까지 남은 시간이 너무 짧음)"
             )
-            
+
         embed = discord.Embed(
-            title="🏁 시즌 강제 시작 완료",
-            description=f"시즌 스케줄을 새롭게 짰습니다!\n**총 {total}경기**가 매칭되었으며, 이제부터 매 10분마다 자동으로 경기가 중계됩니다.",
-            colour=0x2ECC71
+            title="🏁 시즌 일정 편성 완료",
+            description=f"자정까지 **총 {total}경기**가 편성되었습니다. 경기마다 5분간 실시간 중계됩니다!",
+            colour=0x2ECC71,
         )
+        for sport, fxs in self.schedule.items():
+            embed.add_field(name=f"{SPORT_META[sport]['emoji']} {SPORT_META[sport]['league']}",
+                            value=self._schedule_summary(fxs), inline=False)
+        await interaction.followup.send(embed=embed)
+
+    @app_commands.command(name="경기일정", description="진행 중인 경기와 다음 경기 일정을 확인합니다")
+    @app_commands.describe(종목="축구 또는 야구")
+    @app_commands.choices(종목=[
+        app_commands.Choice(name="축구", value="축구"),
+        app_commands.Choice(name="야구", value="야구"),
+    ])
+    async def show_schedule(self, interaction: discord.Interaction, 종목: app_commands.Choice[str]):
+        sport = 종목.value
+        meta = SPORT_META[sport]
+        now = time.time()
+        upcoming = [f for f in self.schedule[sport] if f.kickoff > now][:10]
+        live = self.live[sport]
+        lines = []
+        if live:
+            lines.append(f"🔴 **LIVE** {live.round}R · **{live.home}** vs **{live.away}**")
+        for f in upcoming:
+            t = int(f.kickoff)
+            lines.append(f"<t:{t}:t> (<t:{t}:R>) · {f.round}R · **{f.home}** vs **{f.away}**")
+        embed = discord.Embed(
+            title=f"{meta['emoji']} {meta['league']} 오늘의 일정",
+            description="\n".join(lines) or "남은 경기가 없습니다.",
+            colour=0x3498DB,
+        )
+        embed.set_footer(text=self._schedule_summary(self.schedule[sport]).replace("**", ""))
         await interaction.response.send_message(embed=embed)
+
+    def _schedule_summary(self, fxs):
+        if not fxs:
+            return "편성된 경기 없음 (구단 2개 이상 필요)"
+        gap = (fxs[1].kickoff - fxs[0].kickoff) if len(fxs) > 1 else match_seconds()
+        remaining = sum(1 for f in fxs if f.kickoff > time.time())
+        return (f"**{len(fxs)}경기** · {fxs[-1].round}라운드 · 약 **{gap / 60:.1f}분**마다 킥오프 "
+                f"(남은 경기 {remaining})")
 
     # ═════════════════════════════════════════════════════════
     #  선수 등록 (관리자)
@@ -452,6 +580,14 @@ class SportsCog(commands.Cog):
                 )
 
             team_name = team_row["team_name"]
+            table = "soccer_players" if sport == "축구" else "baseball_players"
+            cap = int(cfg.get(f"{sport}_최대선수"))
+            cur = await db.execute(f"SELECT COUNT(*) FROM {table} WHERE team_name = ?", (team_name,))
+            roster = (await cur.fetchone())[0]
+            if roster >= cap:
+                return await interaction.response.send_message(
+                    f"❌ **{team_name}** 선수단이 가득 찼습니다 ({roster}/{cap}명). "
+                    f"선수를 방출하거나 관리자에게 문의하세요.", ephemeral=True)
             transfer_fee = int(player["base_transfer_fee"] * inflation)
 
             cur = await db.execute(
@@ -469,7 +605,6 @@ class SportsCog(commands.Cog):
                 (transfer_fee, uid),
             )
 
-            table = "soccer_players" if sport == "축구" else "baseball_players"
             await db.execute(
                 f"UPDATE {table} SET team_name = ? WHERE player_name = ?",
                 (team_name, 선수명),
@@ -483,6 +618,7 @@ class SportsCog(commands.Cog):
             colour=0x2ECC71,
         )
         embed.add_field(name="이적료", value=f"{transfer_fee:,}원 (물가 반영)", inline=True)
+        embed.add_field(name="선수단", value=f"{roster + 1}/{cap}명", inline=True)
         await interaction.response.send_message(embed=embed)
 
     # ═════════════════════════════════════════════════════════
@@ -567,480 +703,485 @@ class SportsCog(commands.Cog):
         await interaction.followup.send(embed=embed)
 
     # ═════════════════════════════════════════════════════════
-    #  시즌 생성
+    #  시즌 운영 — 일정 생성 / 종목별 러너
     # ═════════════════════════════════════════════════════════
-    async def generate_season(self):
-        """등록된 팀 수에 따라 시즌 스케줄 생성"""
+    async def start_season(self):
+        """지금부터 자정 직전까지 종목별 일정을 새로 짜고 중계 러너를 띄운다."""
+        await self.stop_runners()
+        async with aiosqlite.connect(self.db) as db:
+            teams = {}
+            for sport in ("축구", "야구"):
+                cur = await db.execute("SELECT team_name FROM sports_teams WHERE sport_type = ?", (sport,))
+                teams[sport] = [r[0] for r in await cur.fetchall()]
+
+        now = time.time()
+        start = now + 30
+        end = next_midnight_kst(now) - match_seconds() - 150
+        for sport in ("축구", "야구"):
+            self.schedule[sport] = build_schedule(sport, teams[sport], start, end)
+            if self.schedule[sport]:
+                self.runners[sport] = asyncio.create_task(self._run_sport(sport))
+            print(f"[SPORTS] {sport} {len(teams[sport])}팀 → {self._schedule_summary(self.schedule[sport])}")
+
+    async def stop_runners(self):
+        tasks_ = [t for t in self.runners.values() if not t.done()]
+        for t in tasks_:
+            t.cancel()
+        if tasks_:
+            await asyncio.gather(*tasks_, return_exceptions=True)
+        self.runners.clear()
+        self.live = {"축구": None, "야구": None}
+
+    async def _run_sport(self, sport):
+        for fx in list(self.schedule[sport]):
+            try:
+                wait = fx.kickoff - time.time()
+                if wait < -match_seconds():
+                    continue  # 너무 늦은 경기(재시작 등)는 건너뜀
+                if wait > PREVIEW_LEAD:
+                    await asyncio.sleep(wait - PREVIEW_LEAD)
+                if not await self._teams_exist(fx):
+                    continue  # 구단 해체된 경기
+                hp, ap = await self._load_players(sport, fx.home, fx.away)
+                ch = await self.get_channel_for(sport)
+                if ch:
+                    await self._send_preview(ch, fx, hp, ap)
+                wait = fx.kickoff - time.time()
+                if wait > 0:
+                    await asyncio.sleep(wait)
+                self.live[sport] = fx
+                await self._play(fx, ch, hp, ap)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                print(f"[SPORTS] {sport} 경기 처리 중 오류: {fx}")
+                traceback.print_exc()
+            finally:
+                self.live[sport] = None
+
+    async def _teams_exist(self, fx):
+        async with aiosqlite.connect(self.db) as db:
+            cur = await db.execute(
+                "SELECT COUNT(*) FROM sports_teams WHERE team_name IN (?, ?)", (fx.home, fx.away))
+            return (await cur.fetchone())[0] == 2
+
+    async def _load_players(self, sport, home, away):
+        table = "soccer_players" if sport == "축구" else "baseball_players"
         async with aiosqlite.connect(self.db) as db:
             db.row_factory = aiosqlite.Row
-            cur = await db.execute(
-                "SELECT team_name FROM sports_teams WHERE sport_type = '축구'"
-            )
-            soccer_teams = [r["team_name"] for r in await cur.fetchall()]
+            out = []
+            for team in (home, away):
+                cur = await db.execute(f"SELECT * FROM {table} WHERE team_name = ?", (team,))
+                out.append([dict(r) for r in await cur.fetchall()])
+        return out
 
-            cur = await db.execute(
-                "SELECT team_name FROM sports_teams WHERE sport_type = '야구'"
-            )
-            baseball_teams = [r["team_name"] for r in await cur.fetchall()]
+    async def get_channel_for(self, sport):
+        soc, bb = await self.get_channels()
+        return soc if sport == "축구" else bb
 
-        # ── 축구 스케줄 (K리그 스타일) ────────────────────
-        self.soccer_queue = []
-        n_soc = len(soccer_teams)
-        if n_soc >= 2:
-            # 12팀 기준 38경기 → 팀 수에 따라 비례 조정
-            games_per_pair = max(2, round(38 / max(n_soc - 1, 1)))
-            for i in range(n_soc):
-                for j in range(i + 1, n_soc):
-                    for k in range(games_per_pair):
-                        if k % 2 == 0:
-                            self.soccer_queue.append(
-                                (soccer_teams[i], soccer_teams[j])
-                            )
-                        else:
-                            self.soccer_queue.append(
-                                (soccer_teams[j], soccer_teams[i])
-                            )
-            random.shuffle(self.soccer_queue)
+    async def _standings(self, sport):
+        """{팀명: (순위, row)}"""
+        async with aiosqlite.connect(self.db) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute("SELECT * FROM sports_teams WHERE sport_type = ?", (sport,))
+            teams = [dict(r) for r in await cur.fetchall()]
+        if sport == "축구":
+            key = lambda t: (t["points"], t["wins"], -t["losses"])
+        else:
+            key = lambda t: (t["wins"] / max(t["wins"] + t["losses"], 1), t["wins"])
+        teams.sort(key=key, reverse=True)
+        return {t["team_name"]: (i + 1, t) for i, t in enumerate(teams)}
 
-        # ── 야구 스케줄 (KBO 스타일) ─────────────────────
-        self.baseball_queue = []
-        n_bb = len(baseball_teams)
-        if n_bb >= 2:
-            # 10팀 기준 144경기 → 팀 수에 따라 비례 조정
-            games_per_pair = max(2, round(144 / max(n_bb - 1, 1)))
-            for i in range(n_bb):
-                for j in range(i + 1, n_bb):
-                    for k in range(games_per_pair):
-                        if k % 2 == 0:
-                            self.baseball_queue.append(
-                                (baseball_teams[i], baseball_teams[j])
-                            )
-                        else:
-                            self.baseball_queue.append(
-                                (baseball_teams[j], baseball_teams[i])
-                            )
-            random.shuffle(self.baseball_queue)
+    def _morale(self, team):
+        """최근 5경기 기세 -1.0 ~ +1.0 (설정 배율 반영)"""
+        f = self.form.get(team, [])[-FORM_GAMES:]
+        raw = (f.count("W") - f.count("L")) / FORM_GAMES
+        return max(-1.0, min(1.0, raw * cfg.get("경기_폼영향")))
 
-        self.season_active = True
-        total = len(self.soccer_queue) + len(self.baseball_queue)
-        print(
-            f"[SPORTS] 시즌 생성 완료 — "
-            f"축구 {len(self.soccer_queue)}경기 ({n_soc}팀) / "
-            f"야구 {len(self.baseball_queue)}경기 ({n_bb}팀) / "
-            f"총 {total}경기"
+    def _form_str(self, team):
+        f = self.form.get(team, [])[-FORM_GAMES:]
+        return "".join({"W": "🟢", "D": "⚪", "L": "🔴"}[x] for x in f) or "기록 없음"
+
+    def _streak(self, team):
+        f = self.form.get(team, [])
+        if not f:
+            return None, 0
+        last, n = f[-1], 0
+        for x in reversed(f):
+            if x != last:
+                break
+            n += 1
+        return last, n
+
+    def _sim_kwargs(self, fx):
+        if fx.sport == "축구":
+            return {"tune": cfg.tune("축구"), "form": (self._morale(fx.home), self._morale(fx.away))}
+        return {"tune": cfg.tune("야구"),
+                "form": (self._morale(fx.away), self._morale(fx.home)),
+                "starters": (self.rotation.get(fx.away, 0), self.rotation.get(fx.home, 0))}
+
+    @staticmethod
+    def _record_str(sport, row):
+        if not row:
+            return "-"
+        if sport == "축구":
+            return f"{row['wins']}승 {row['draws']}무 {row['losses']}패 (승점 {row['points']})"
+        tot = row["wins"] + row["losses"]
+        return f"{row['wins']}승 {row['draws']}무 {row['losses']}패 (승률 {row['wins'] / max(tot, 1):.3f})"
+
+    # ═════════════════════════════════════════════════════════
+    #  프리뷰
+    # ═════════════════════════════════════════════════════════
+    async def _send_preview(self, ch, fx, hp, ap):
+        meta = SPORT_META[fx.sport]
+        st = await self._standings(fx.sport)
+        kw = self._sim_kwargs(fx)
+        extra = None
+        if fx.sport == "축구":
+            p1, pd, p2 = await asyncio.to_thread(win_odds, "축구", fx.home, fx.away, hp, ap, **kw)
+            odds = _odds_bar(p1, pd, p2, fx.home, fx.away, "축구")
+            matchup = f"🏠 **{fx.home}** vs **{fx.away}** ✈️"
+        else:
+            p_away, pd, p_home = await asyncio.to_thread(win_odds, "야구", fx.away, fx.home, ap, hp, **kw)
+            odds = _odds_bar(p_away, pd, p_home, fx.away, fx.home, "야구")
+            matchup = f"✈️ **{fx.away}** @ **{fx.home}** 🏠"
+            sp_a = baseball_team_profile(ap, fx.away, kw["starters"][0])["starter"]
+            sp_h = baseball_team_profile(hp, fx.home, kw["starters"][1])["starter"]
+            extra = f"**{sp_a['player_name']}** (구위 {sp_a['arm']}) vs **{sp_h['player_name']}** (구위 {sp_h['arm']})"
+        t = int(fx.kickoff)
+        embed = discord.Embed(
+            title=f"🔜 {meta['emoji']} {meta['league']} {fx.round}라운드 — 곧 시작합니다!",
+            description=f"{matchup}\n⏰ 킥오프 <t:{t}:R>",
+            colour=0x95A5A6,
         )
+        for team in (fx.home, fx.away):
+            rank, row = st.get(team, (None, None))
+            embed.add_field(name=f"{team} {f'({rank}위)' if rank else ''}",
+                            value=f"{self._record_str(fx.sport, row)}\n최근 {self._form_str(team)}", inline=True)
+        if extra:
+            embed.add_field(name="⚾ 선발 투수", value=extra, inline=False)
+        embed.add_field(name="🔮 승부 예측", value=odds, inline=False)
+        await ch.send(embed=embed)
 
     # ═════════════════════════════════════════════════════════
-    #  축구 경기 시뮬레이션 (FIFA 6스탯 기반)
+    #  경기 진행 (시뮬레이션 → 실시간 중계 → 기록 반영)
     # ═════════════════════════════════════════════════════════
-    async def simulate_soccer(self, team_a: str, team_b: str) -> tuple[int, int, list[str]]:
-        """FIFA 스탯 기반 축구 매치 시뮬레이션"""
-        async with aiosqlite.connect(self.db) as db:
-            db.row_factory = aiosqlite.Row
-            cur = await db.execute(
-                "SELECT * FROM soccer_players WHERE team_name = ?", (team_a,)
-            )
-            players_a = await cur.fetchall()
-            cur = await db.execute(
-                "SELECT * FROM soccer_players WHERE team_name = ?", (team_b,)
-            )
-            players_b = await cur.fetchall()
+    async def _play(self, fx, ch, hp, ap):
+        before = await self._standings(fx.sport)
+        kw = self._sim_kwargs(fx)
+        if fx.sport == "축구":
+            match = await asyncio.to_thread(simulate_soccer, fx.home, fx.away, hp, ap, None, **kw)
+            frames, clock = self._soccer_frames(match)
+            render = lambda shown, el, pending=None, final=False: self._render_soccer(
+                fx, match, shown, clock(el), pending, final)
+            first, second = fx.home, fx.away
+        else:
+            match = await asyncio.to_thread(simulate_baseball, fx.away, fx.home, ap, hp, None, **kw)
+            frames = self._baseball_frames(match)
+            render = lambda shown, el, pending=None, final=False: self._render_baseball(
+                fx, match, shown, pending, final)
+            first, second = fx.away, fx.home
 
-        # 선수가 없으면 더미 선수
-        if not players_a:
-            players_a = [{"player_name": f"{team_a} 무명선수", "pace": 50, "shooting": 50,
-                          "passing": 50, "dribbling": 50, "defending": 50, "physical": 50}]
-        if not players_b:
-            players_b = [{"player_name": f"{team_b} 무명선수", "pace": 50, "shooting": 50,
-                          "passing": 50, "dribbling": 50, "defending": 50, "physical": 50}]
+        if ch:
+            await self._broadcast(ch, frames, render)
 
-        # 팀 평균 스탯 계산
-        def team_avg(players, *stats):
-            total = sum(sum(p[s] for s in stats) for p in players)
-            return total / (len(players) * len(stats))
+        s1, s2 = match.score
+        await self.update_record(first, second, s1, s2, fx.sport)
+        for team, mine, theirs in ((first, s1, s2), (second, s2, s1)):
+            self.form.setdefault(team, []).append("W" if mine > theirs else "L" if mine < theirs else "D")
+            self.form[team] = self.form[team][-10:]
+            if fx.sport == "야구":
+                self.rotation[team] = self.rotation.get(team, 0) + 1
+        after = await self._standings(fx.sport)
+        if ch:
+            await self._send_final(ch, fx, match, first, second, before, after)
 
-        attack_a = team_avg(players_a, "pace", "shooting", "dribbling", "passing")
-        defense_a = team_avg(players_a, "defending", "physical")
-        attack_b = team_avg(players_b, "pace", "shooting", "dribbling", "passing")
-        defense_b = team_avg(players_b, "defending", "physical")
-
-        score_a, score_b = 0, 0
-        events = []
-
-        for minute in range(1, 91):
-            # 약 5~8% 확률로 공격 이벤트 발생
-            chance = 0.04 + (attack_a + attack_b) / 5000
-            if random.random() > chance:
-                continue
-
-            # 어느 팀이 공격하는지
-            attack_weight_a = attack_a / max(attack_a + attack_b, 1)
-            is_a_attacking = random.random() < attack_weight_a
-
-            if is_a_attacking:
-                attacker = random.choice(players_a)
-                att_power = (
-                    attacker["shooting"] * 0.4
-                    + attacker["pace"] * 0.2
-                    + attacker["dribbling"] * 0.25
-                    + attacker["passing"] * 0.15
-                    + random.uniform(-15, 15)
-                )
-                def_power = defense_b + random.uniform(-10, 10)
-            else:
-                attacker = random.choice(players_b)
-                att_power = (
-                    attacker["shooting"] * 0.4
-                    + attacker["pace"] * 0.2
-                    + attacker["dribbling"] * 0.25
-                    + attacker["passing"] * 0.15
-                    + random.uniform(-15, 15)
-                )
-                def_power = defense_a + random.uniform(-10, 10)
-
-            goal_chance = att_power / max(att_power + def_power, 1)
-
-            if random.random() < goal_chance * 0.45:
-                # 골!
-                if is_a_attacking:
-                    score_a += 1
-                else:
-                    score_b += 1
-                template = random.choice(SOCCER_GOAL_TEXTS)
-                events.append(template.format(
-                    minute=minute, player=attacker["player_name"]
-                ))
-            elif random.random() < 0.5:
-                # 세이브/빗나감
-                defending_team = team_b if is_a_attacking else team_a
-                template = random.choice(SOCCER_SAVE_TEXTS)
-                events.append(template.format(
-                    minute=minute, player=attacker["player_name"],
-                    team_b=defending_team
-                ))
-            else:
-                # 기타 이벤트
-                event_player = random.choice(
-                    players_a if is_a_attacking else players_b
-                )
-                attacking_team = team_a if is_a_attacking else team_b
-                template = random.choice(SOCCER_EVENT_TEXTS)
-                events.append(template.format(
-                    minute=minute, player=event_player["player_name"],
-                    team=attacking_team
-                ))
-
-        return score_a, score_b, events
-
-    # ═════════════════════════════════════════════════════════
-    #  야구 경기 시뮬레이션 (정식 룰 반영)
-    # ═════════════════════════════════════════════════════════
-    async def simulate_baseball(self, team_a: str, team_b: str) -> tuple[int, int, list[str]]:
-        """
-        정식 야구 룰 기반 시뮬레이션
-        - 9이닝제 (9회말 홈팀 리드 시 스킵)
-        - 동점 시 연장전 (최대 12회까지)
-        - 볼넷(사사구) 포함
-        - 희생플라이 포함
-        - team_a = 원정팀(선공), team_b = 홈팀(후공)
-        """
-        async with aiosqlite.connect(self.db) as db:
-            db.row_factory = aiosqlite.Row
-            cur = await db.execute(
-                "SELECT * FROM baseball_players WHERE team_name = ?", (team_a,)
-            )
-            players_a = await cur.fetchall()
-            cur = await db.execute(
-                "SELECT * FROM baseball_players WHERE team_name = ?", (team_b,)
-            )
-            players_b = await cur.fetchall()
-
-        # 선수 없으면 더미 생성
-        if not players_a:
-            players_a = [{"player_name": f"{team_a} 무명타자", "contact": 50,
-                          "power": 50, "run": 50, "arm": 50, "field": 50}]
-        if not players_b:
-            players_b = [{"player_name": f"{team_b} 무명타자", "contact": 50,
-                          "power": 50, "run": 50, "arm": 50, "field": 50}]
-
-        score_a, score_b = 0, 0
-        events = []
-        batter_idx_a = 0  # 원정팀 타순
-        batter_idx_b = 0  # 홈팀 타순
-
-        def team_defense_avg(players):
-            return sum(p["arm"] + p["field"] for p in players) / (len(players) * 2)
-
-        def simulate_half_inning(batting_players, fielding_players, inning, is_top, batter_idx):
-            """하프이닝 시뮬레이션. 반환: (득점, 이벤트 리스트, 다음 타자 인덱스)"""
-            outs = 0
-            bases = [False, False, False]  # 1루, 2루, 3루
-            runs = 0
-            half_label = "초" if is_top else "말"
-            defense_avg = team_defense_avg(fielding_players)
-            local_events = []
-
-            while outs < 3:
-                batter = batting_players[batter_idx % len(batting_players)]
-                batter_idx += 1
-
-                # === 볼넷(사사구) 판정 ===
-                # 투수 컨트롤 = 수비 평균으로 대체, 볼넷 확률 ~8-12%
-                walk_chance = 0.08 + (100 - defense_avg) / 1500
-                if random.random() < walk_chance:
-                    # 볼넷 → 타자 출루
-                    if bases[0] and bases[1] and bases[2]:
-                        # 만루 볼넷 → 밀어내기 1점
-                        runs += 1
-                        local_events.append(
-                            f"🚶 {inning}회{half_label} | **{batter['player_name']}** 볼넷! 만루에서 밀어내기 1점!"
-                        )
-                    else:
-                        # 일반 볼넷
-                        if bases[0] and bases[1]:
-                            bases[2] = True
-                        if bases[0]:
-                            bases[1] = True
-                        bases[0] = True
-                        local_events.append(
-                            f"🚶 {inning}회{half_label} | **{batter['player_name']}** 볼넷으로 출루."
-                        )
+    async def _broadcast(self, ch, frames, render):
+        loop = asyncio.get_running_loop()
+        msg = await ch.send(embed=render(0, 0.0))
+        start = loop.time()
+        shift = 0.0          # 뜸 들인 시간만큼 타임라인을 뒤로 민다
+        shown = 0
+        last_edit = loop.time()
+        try:
+            while shown < len(frames):
+                now = loop.time() - start - shift
+                t_next, ev = frames[shown]
+                if t_next > now:
+                    if loop.time() - last_edit >= EDIT_INTERVAL:
+                        msg = await self._safe_edit(ch, msg, render(shown, now))
+                        last_edit = loop.time()
+                    await asyncio.sleep(max(0.3, min(t_next - now, EDIT_INTERVAL)))
                     continue
 
-                # === 타격 판정: contact vs 수비 ===
-                hit_chance = batter["contact"] / (batter["contact"] + defense_avg + 20)
-                roll = random.random()
+                if ev.buildup:
+                    msg = await self._safe_edit(ch, msg, render(shown, t_next, pending=ev.buildup))
+                    await asyncio.sleep(suspense())
+                    shift += suspense()
 
-                if roll < hit_chance:
-                    # 안타 종류 결정 (power 기반)
-                    power_roll = random.random() * 100
-                    power_factor = batter["power"]
+                alerts = []
+                while True:
+                    alerts.append(frames[shown][1].alert)
+                    shown += 1
+                    if (shown >= len(frames) or frames[shown][0] > now
+                            or frames[shown][1].buildup):
+                        break
+                final = shown >= len(frames)
+                msg = await self._safe_edit(ch, msg, render(shown, frames[shown - 1][0], final=final))
+                last_edit = loop.time()
+                for a in alerts:
+                    if a:
+                        await ch.send(a)
+                if not final:
+                    await asyncio.sleep(MIN_EDIT_GAP)
+        except asyncio.CancelledError:
+            try:
+                e = render(shown, 0.0)
+                e.set_footer(text="⛔ 시즌 일정이 재편성되어 중계가 중단되었습니다 (기록 미반영)")
+                await msg.edit(embed=e)
+            except Exception:
+                pass
+            raise
 
-                    if power_factor > 70 and power_roll < power_factor * 0.10:
-                        # ── 홈런 ──
-                        runners_on = sum(1 for b in bases if b)
-                        rbi = 1 + runners_on
-                        runs += rbi
-                        bases = [False, False, False]
-                        if runners_on == 3:
-                            template = random.choice(BASEBALL_HIT_TEXTS["만루홈런"])
-                        else:
-                            template = random.choice(BASEBALL_HIT_TEXTS["홈런"])
-                        local_events.append(template.format(
-                            inning=f"{inning}회{half_label}", batter=batter["player_name"]
-                        ))
-                    elif power_roll < power_factor * 0.22:
-                        # ── 2루타 ──
-                        if bases[2]:
-                            runs += 1
-                        if bases[1]:
-                            runs += 1
-                        bases[2] = bases[0]
-                        bases[1] = True
-                        bases[0] = False
-                        template = random.choice(BASEBALL_HIT_TEXTS["2루타"])
-                        local_events.append(template.format(
-                            inning=f"{inning}회{half_label}", batter=batter["player_name"]
-                        ))
-                    elif power_roll < power_factor * 0.26:
-                        # ── 3루타 ──
-                        scored = sum(1 for b in bases if b)
-                        runs += scored
-                        bases = [False, False, True]
-                        template = random.choice(BASEBALL_HIT_TEXTS["3루타"])
-                        local_events.append(template.format(
-                            inning=f"{inning}회{half_label}", batter=batter["player_name"]
-                        ))
-                    else:
-                        # ── 안타 (1루타) ──
-                        if bases[2]:
-                            runs += 1
-                            bases[2] = False
-                        # 주자 진루 (2루 → 3루)
-                        if bases[1]:
-                            # 주루 능력에 따라 홈 터치 여부
-                            if batter["run"] > 60 and random.random() < 0.35:
-                                runs += 1
-                                bases[1] = False
-                            else:
-                                bases[2] = True
-                                bases[1] = False
-                        if bases[0]:
-                            bases[1] = True
-                        bases[0] = True
-                        template = random.choice(BASEBALL_HIT_TEXTS["안타"])
-                        local_events.append(template.format(
-                            inning=f"{inning}회{half_label}", batter=batter["player_name"]
-                        ))
+    async def _safe_edit(self, ch, msg, embed):
+        try:
+            await msg.edit(embed=embed)
+            return msg
+        except discord.NotFound:
+            return await ch.send(embed=embed)  # 누가 전광판을 지웠으면 새로 띄움
+        except discord.HTTPException:
+            return msg
 
-                    # === 도루 시도 (run 스탯 기반) ===
-                    if bases[0] and not bases[1] and batter["run"] > 65 and random.random() < 0.15:
-                        if random.random() < batter["run"] / (batter["run"] + defense_avg):
-                            bases[1] = True
-                            bases[0] = False
-                            local_events.append(random.choice(BASEBALL_STEAL_TEXTS).format(
-                                inning=f"{inning}회{half_label}",
-                                runner=batter["player_name"]
-                            ))
-                        else:
-                            outs += 1
-                            bases[0] = False
-                            local_events.append(BASEBALL_STEAL_TEXTS[1].format(
-                                inning=f"{inning}회{half_label}",
-                                runner=batter["player_name"]
-                            ))
-                else:
-                    # === 아웃 처리 ===
-                    fielder = random.choice(fielding_players)
+    # ── 축구 타임라인 ─────────────────────────────────────
+    @staticmethod
+    def _soccer_frames(match):
+        ev = match.events
+        n_bu = sum(1 for e in ev if e.buildup)
+        total = max(match_seconds() * 0.6, match_seconds() - 8 - n_bu * suspense())
+        first, ht = total * 0.47, total * 0.06
+        second = total - first - ht
+        len1, len2 = 45 + match.stoppage[0], 45 + match.stoppage[1]
 
-                    # 희생플라이 판정: 아웃 1개 미만 + 3루 주자 있을 때
-                    if outs < 2 and bases[2] and random.random() < 0.35:
-                        outs += 1
-                        runs += 1
-                        bases[2] = False
-                        local_events.append(
-                            f"✈️ {inning}회{half_label} | **{batter['player_name']}** 희생플라이! "
-                            f"3루 주자 홈인! (타자 아웃)"
-                        )
-                    # 병살타 판정: 아웃 1개 미만 + 1루 주자 있을 때
-                    elif outs < 2 and bases[0] and random.random() < 0.20:
-                        outs += 2
-                        bases[0] = False
-                        local_events.append(
-                            f"⬇️⬇️ {inning}회{half_label} | **{batter['player_name']}** 병살타! "
-                            f"**{fielder['player_name']}**의 빠른 중계 플레이!"
-                        )
-                    else:
-                        outs += 1
-                        template = random.choice(BASEBALL_OUT_TEXTS)
-                        local_events.append(template.format(
-                            inning=f"{inning}회{half_label}",
-                            batter=batter["player_name"],
-                            fielder=fielder["player_name"],
-                        ))
+        def at(e):
+            if e.half == 1:
+                return first * min(e.minute, len1) / len1
+            if e.kind == "ko":
+                return first + ht
+            return first + ht + second * min(e.minute - 45, len2) / len2
 
-            return runs, local_events, batter_idx
+        def label(abs_min, half):
+            reg = 45 if half == 1 else 90
+            return f"{abs_min}'" if abs_min <= reg else f"{reg}+{abs_min - reg}'"
 
-        # ═══ 정규 이닝 (1~9회) ═══
-        for inning in range(1, 10):
-            # 상위 (team_a = 원정팀 공격)
-            runs, evts, batter_idx_a = simulate_half_inning(
-                players_a, players_b, inning, True, batter_idx_a
-            )
-            score_a += runs
-            events.extend(evts)
+        def clock(el):
+            if el < first:
+                return label(min(int(el / first * len1) + 1, len1), 1)
+            if el < first + ht:
+                return "하프타임"
+            m = min(int((el - first - ht) / second * len2) + 1, len2)
+            return label(45 + m, 2)
 
-            # 9회말: 홈팀(team_b)이 이미 이기고 있으면 스킵 (끝내기 불필요)
-            if inning == 9 and score_b > score_a:
-                events.append(f"🏁 9회말 스킵 — **{team_b}**(홈) {score_b}:{score_a} 리드로 경기 종료!")
-                break
+        return [(at(e), e) for e in ev], clock
 
-            # 하위 (team_b = 홈팀 공격)
-            runs, evts, batter_idx_b = simulate_half_inning(
-                players_b, players_a, inning, False, batter_idx_b
-            )
-            score_b += runs
-            events.extend(evts)
+    def _render_soccer(self, fx, match, shown, clock, pending, final):
+        evs = match.events[:shown]
+        last = evs[-1] if evs else None
+        s = last.score if last else (0, 0)
+        shots = last.shots if last else (0, 0)
+        on_t = last.on_target if last else (0, 0)
+        poss = last.poss if last else 50.0
+        if final:
+            clock = "경기 종료"
+        elif last and last.kind == "ht":
+            clock = "하프타임"
 
-            # 9회말 끝내기: 홈팀이 역전하면 즉시 종료
-            if inning == 9 and score_b > score_a:
-                events.append(f"🎉 끝내기 승리! **{team_b}**(홈)가 {score_b}:{score_a}로 승리!")
-                break
+        embed = discord.Embed(
+            title=(f"🏁 경기 종료 · ⚽ K리그 {fx.round}R" if final else f"🔴 LIVE · ⚽ K리그 {fx.round}R"),
+            description=f"## {fx.home} {s[0]} : {s[1]} {fx.away}\n⏱️ **{clock}**",
+            colour=0xF1C40F if final else 0xE74C3C,
+        )
+        scorers = [[], []]
+        cards = [[0, 0], [0, 0]]
+        for e in evs:
+            if e.kind == "goal":
+                scorers[e.team].append(f"{e.scorer} {e.label}")
+            elif e.kind == "yellow":
+                cards[e.team][0] += 1
+            elif e.kind == "red":
+                cards[e.team][1] += 1
+        if scorers[0] or scorers[1]:
+            embed.add_field(name="⚽ 득점", value=(
+                f"**{fx.home}**: {', '.join(scorers[0]) or '-'}\n**{fx.away}**: {', '.join(scorers[1]) or '-'}"
+            )[:1024], inline=False)
+        embed.add_field(name="📊 기록", value=(
+            f"슈팅 **{shots[0]}** - **{shots[1]}** · 유효 **{on_t[0]}** - **{on_t[1]}**\n"
+            f"점유율 **{poss:.0f}%** - **{100 - poss:.0f}%** · "
+            f"🟨{cards[0][0]} 🟥{cards[0][1]} - 🟨{cards[1][0]} 🟥{cards[1][1]}"
+        ), inline=False)
+        log = [e.text for e in evs][-LOG_LINES:]
+        if pending:
+            log.append(f"**{pending}**")
+        embed.add_field(name="📺 문자중계", value=_trim_log(log), inline=False)
+        embed.set_footer(text=f"🏠 {fx.home} · 5분 실시간 중계")
+        return embed
 
-        # ═══ 연장전 (10~12회, 동점일 경우) ═══
-        if score_a == score_b:
-            for inning in range(10, 13):
-                events.append(f"⏰ **연장 {inning}회 돌입!**")
+    # ── 야구 타임라인 ─────────────────────────────────────
+    @staticmethod
+    def _baseball_frames(match):
+        weights = {"pa": 1.0, "info": 0.6, "change": 0.6, "inning": 0.5, "end": 0.0}
+        ev = match.events
+        n_bu = sum(1 for e in ev if e.buildup)
+        total = max(match_seconds() * 0.6, match_seconds() - 8 - n_bu * suspense())
+        unit = total / max(sum(weights[e.kind] for e in ev), 1)
+        frames, t = [], 0.0
+        for e in ev:
+            frames.append((t, e))
+            t += weights[e.kind] * unit
+        return frames
 
-                runs, evts, batter_idx_a = simulate_half_inning(
-                    players_a, players_b, inning, True, batter_idx_a
-                )
-                score_a += runs
-                events.extend(evts)
+    def _render_baseball(self, fx, match, shown, pending, final):
+        evs = match.events[:shown]
+        last = evs[-1] if evs else None
+        s = last.score if last else (0, 0)
+        names = (fx.away, fx.home)
 
-                runs, evts, batter_idx_b = simulate_half_inning(
-                    players_b, players_a, inning, False, batter_idx_b
-                )
-                score_b += runs
-                events.extend(evts)
+        # 라인스코어
+        n_inn = max(9, max((e.inning for e in evs), default=1))
+        line = [[None] * n_inn, [None] * n_inn]
+        hits = [0, 0]
+        for e in evs:
+            k = 0 if e.top else 1
+            if e.kind == "inning":
+                line[k][e.inning - 1] = 0
+            line[k][e.inning - 1] = (line[k][e.inning - 1] or 0) + e.runs
+            hits[k] += 1 if e.hit else 0
+        if final and s[1] > s[0] and line[1][match.innings - 1] is None:
+            line[1][match.innings - 1] = "X"
+        head = _pad("", 8) + "".join(f"{i + 1:>3}" for i in range(n_inn)) + " │  R  H"
+        rows = [head]
+        for k in (0, 1):
+            cells = "".join(f"{'' if v is None else v:>3}" for v in line[k])
+            rows.append(_pad(names[k], 8) + cells + f" │ {s[k]:>2} {hits[k]:>2}")
+        board = "```\n" + "\n".join(rows) + "\n```"
 
-                # 연장 이닝 종료 후 점수 차이 나면 끝
-                if score_a != score_b:
-                    break
+        if final:
+            status = "경기 종료"
+        elif last is None:
+            status = "플레이볼 대기"
+        else:
+            half = "초" if last.top else "말"
+            outs = "●" * min(last.outs, 3) + "○" * (3 - min(last.outs, 3))
+            status = f"{last.inning}회{half} · {outs}" + (" · 공수교대" if last.outs >= 3 else "")
 
-            # 12회까지 동점이면 무승부 (KBO 규정)
-            if score_a == score_b:
-                events.append("🤝 12회까지 동점! KBO 규정에 따라 무승부 처리.")
+        embed = discord.Embed(
+            title=(f"🏁 경기 종료 · ⚾ KBO {fx.round}R" if final else f"🔴 LIVE · ⚾ KBO {fx.round}R"),
+            description=f"## {fx.away} {s[0]} : {s[1]} {fx.home}\n⏱️ **{status}**\n{board}",
+            colour=0xF1C40F if final else 0xE74C3C,
+        )
+        if last and not final and last.outs < 3:
+            b = last.bases
+            mark = lambda x: "◆" if x else "◇"
+            diamond = f"```\n   {mark(b[1])}\n{mark(b[2])}     {mark(b[0])}\n   ⌂\n```"
+            runners = ", ".join(f"{i + 1}루 {n}" for i, n in enumerate(b) if n) or "주자 없음"
+            embed.add_field(name="💎 주자", value=f"{diamond}{runners}", inline=True)
+        mound = next((e for e in reversed(evs) if e.pitcher), None)
+        if mound and not final:
+            pc = f" · {mound.pitches}구" if mound.kind == "pa" else " · 등판"
+            embed.add_field(name="🎯 마운드", value=f"**{mound.pitcher}**{pc}", inline=True)
+        log = [e.text for e in evs if e.kind != "inning"][-LOG_LINES:]
+        if pending:
+            log.append(f"**{pending}**")
+        embed.add_field(name="📺 문자중계", value=_trim_log(log), inline=False)
+        embed.set_footer(text=f"✈️ {fx.away} @ 🏠 {fx.home} · 5분 실시간 중계")
+        return embed
 
-        return score_a, score_b, events
+    # ── 경기 후 결과 + 순위 변동 ──────────────────────────
+    async def _send_final(self, ch, fx, match, first, second, before, after):
+        meta = SPORT_META[fx.sport]
+        s1, s2 = match.score
+        if s1 > s2:
+            result = f"🏆 **{first}** 승리!"
+        elif s2 > s1:
+            result = f"🏆 **{second}** 승리!"
+        else:
+            result = "🤝 무승부"
+
+        lines = []
+        for team in (first, second):
+            b = before.get(team, (None, None))[0]
+            a, row = after.get(team, (None, None))
+            arrow = ""
+            if b and a:
+                arrow = " ▲" if a < b else (" ▼" if a > b else " -")
+            lines.append(f"**{team}** {b or '?'}위 → **{a or '?'}위**{arrow} · {self._record_str(fx.sport, row)}")
+
+        # MVP
+        mvp = None
+        if fx.sport == "축구":
+            goals = {}
+            for e in match.events:
+                if e.kind == "goal":
+                    goals[e.scorer] = goals.get(e.scorer, 0) + 1
+            if goals:
+                name, g = max(goals.items(), key=lambda kv: kv[1])
+                mvp = f"**{name}** — {'해트트릭!! 🎩' if g >= 3 else f'{g}골'}"
+        else:
+            rbi = {}
+            for e in match.events:
+                if e.kind == "pa" and e.batter:
+                    rbi[e.batter] = rbi.get(e.batter, 0) + e.runs * 2 + (1 if e.hit else 0) + (2 if "홈런" in e.text else 0)
+            if rbi:
+                name = max(rbi, key=rbi.get)
+                hr = sum(1 for e in match.events if e.batter == name and "홈런" in e.text and e.kind == "pa")
+                h = sum(1 for e in match.events if e.batter == name and e.hit)
+                r = sum(e.runs for e in match.events if e.batter == name and e.kind == "pa")
+                mvp = f"**{name}** — {h}안타 {r}타점" + (f" {hr}홈런" if hr else "")
+
+        embed = discord.Embed(
+            title=f"{meta['emoji']} FINAL · {first} {s1} : {s2} {second}",
+            description=result,
+            colour=0x2ECC71 if s1 != s2 else 0x95A5A6,
+        )
+        if mvp:
+            embed.add_field(name="⭐ 오늘의 선수", value=mvp, inline=False)
+        streaks = []
+        for team in (first, second):
+            kind, n = self._streak(team)
+            if kind == "W" and n >= 3:
+                streaks.append(f"🔥 **{team}** {n}연승 질주!")
+            elif kind == "L" and n >= 3:
+                streaks.append(f"💀 **{team}** {n}연패 수렁…")
+        if streaks:
+            embed.add_field(name="📈 기세", value="\n".join(streaks), inline=False)
+        embed.add_field(name="📊 순위 변동", value="\n".join(lines), inline=False)
+        nxt = next((f for f in self.schedule[fx.sport] if f.kickoff > time.time()), None)
+        if nxt:
+            embed.add_field(name="⏭️ 다음 경기",
+                            value=f"**{nxt.home}** vs **{nxt.away}** · <t:{int(nxt.kickoff)}:R>", inline=False)
+        await ch.send(embed=embed)
 
     # ═════════════════════════════════════════════════════════
     #  DB 전적 업데이트
     # ═════════════════════════════════════════════════════════
     async def update_record(self, team_a: str, team_b: str, score_a: int, score_b: int, sport: str):
-        """승/무/패 DB 업데이트"""
+        """승/무/패 DB 업데이트 — 축구: 승 3점 / 무 1점, 야구: 승률(무승부 제외)"""
+        win_pts = 3 if sport == "축구" else 1
+        draw_pts = 1 if sport == "축구" else 0
         async with aiosqlite.connect(self.db) as db:
-            if score_a > score_b:
-                win, lose = team_a, team_b
-                if sport == "축구":
-                    await db.execute(
-                        "UPDATE sports_teams SET wins = wins + 1, points = points + 3 WHERE team_name = ?",
-                        (win,),
-                    )
-                    await db.execute(
-                        "UPDATE sports_teams SET losses = losses + 1 WHERE team_name = ?",
-                        (lose,),
-                    )
-                else:
-                    await db.execute(
-                        "UPDATE sports_teams SET wins = wins + 1, points = points + 1 WHERE team_name = ?",
-                        (win,),
-                    )
-                    await db.execute(
-                        "UPDATE sports_teams SET losses = losses + 1 WHERE team_name = ?",
-                        (lose,),
-                    )
-            elif score_a < score_b:
-                win, lose = team_b, team_a
-                if sport == "축구":
-                    await db.execute(
-                        "UPDATE sports_teams SET wins = wins + 1, points = points + 3 WHERE team_name = ?",
-                        (win,),
-                    )
-                    await db.execute(
-                        "UPDATE sports_teams SET losses = losses + 1 WHERE team_name = ?",
-                        (lose,),
-                    )
-                else:
-                    await db.execute(
-                        "UPDATE sports_teams SET wins = wins + 1, points = points + 1 WHERE team_name = ?",
-                        (win,),
-                    )
-                    await db.execute(
-                        "UPDATE sports_teams SET losses = losses + 1 WHERE team_name = ?",
-                        (lose,),
-                    )
+            if score_a == score_b:
+                await db.execute(
+                    "UPDATE sports_teams SET draws = draws + 1, points = points + ? WHERE team_name IN (?, ?)",
+                    (draw_pts, team_a, team_b),
+                )
             else:
-                # 무승부 — 축구: 승점 1점 / 야구: KBO 12회 무승부
-                if sport == "축구":
-                    await db.execute(
-                        "UPDATE sports_teams SET draws = draws + 1, points = points + 1 WHERE team_name = ?",
-                        (team_a,),
-                    )
-                    await db.execute(
-                        "UPDATE sports_teams SET draws = draws + 1, points = points + 1 WHERE team_name = ?",
-                        (team_b,),
-                    )
-                else:
-                    # 야구 무승부 (12회 규정)
-                    await db.execute(
-                        "UPDATE sports_teams SET draws = draws + 1 WHERE team_name = ?",
-                        (team_a,),
-                    )
-                    await db.execute(
-                        "UPDATE sports_teams SET draws = draws + 1 WHERE team_name = ?",
-                        (team_b,),
-                    )
+                win, lose = (team_a, team_b) if score_a > score_b else (team_b, team_a)
+                await db.execute(
+                    "UPDATE sports_teams SET wins = wins + 1, points = points + ? WHERE team_name = ?",
+                    (win_pts, win),
+                )
+                await db.execute(
+                    "UPDATE sports_teams SET losses = losses + 1 WHERE team_name = ?", (lose,)
+                )
             await db.commit()
 
     # ═════════════════════════════════════════════════════════
@@ -1059,96 +1200,12 @@ class SportsCog(commands.Cog):
         return soc_ch, bb_ch
 
     # ═════════════════════════════════════════════════════════
-    #  경기 결과 Embed 전송
-    # ═════════════════════════════════════════════════════════
-    async def send_match_result(self, channel, sport_emoji, team_a, team_b, score_a, score_b, events):
-        """경기 결과를 중계 채널에 전송"""
-        if not channel:
-            return
-
-        # 주요 이벤트만 선별 (최대 12개)
-        key_events = [e for e in events if any(k in e for k in ["⚽", "💥", "🔥", "🏏", "🎉", "⏰", "🏁", "✈️", "⬇️⬇️"])]
-        if not key_events:
-            key_events = events[:6]
-        else:
-            key_events = key_events[:12]
-
-        if score_a > score_b:
-            result_text = f"🏆 **{team_a}** 승리!"
-        elif score_b > score_a:
-            result_text = f"🏆 **{team_b}** 승리!"
-        else:
-            result_text = "🤝 무승부!"
-
-        embed = discord.Embed(
-            title=f"{sport_emoji} {team_a} vs {team_b}",
-            description=f"## {score_a} : {score_b}\n{result_text}",
-            colour=0x2ECC71 if score_a > score_b else (0xE74C3C if score_b > score_a else 0x95A5A6),
-        )
-
-        if key_events:
-            # 이벤트를 1024자 이내로 제한
-            event_text = "\n".join(key_events)
-            if len(event_text) > 1024:
-                event_text = "\n".join(key_events[:8])
-            embed.add_field(name="📺 주요 장면", value=event_text, inline=False)
-
-        embed.set_footer(text=f"가상 국가 스포츠 리그 · {datetime.now().strftime('%H:%M')}")
-        await channel.send(embed=embed)
-
-    # ═════════════════════════════════════════════════════════
-    #  5분 루프 스케줄러 — 한 경기씩 중계
-    # ═════════════════════════════════════════════════════════
-    @tasks.loop(minutes=5)
-    async def match_scheduler(self):
-        """5분마다 경기 큐에서 딱 1경기만 꺼내서 중계한다."""
-        if not self.season_active:
-            return
-
-        if not self.soccer_queue and not self.baseball_queue:
-            self.season_active = False
-            return
-
-        soccer_ch, baseball_ch = await self.get_channels()
-
-        # 축구와 야구를 번갈아가며 1경기씩 진행
-        if self.soccer_queue and self.baseball_queue:
-            # 둘 다 남아있으면 번갈아 진행 (짝수 턴=축구, 홀수 턴=야구)
-            if len(self.soccer_queue) >= len(self.baseball_queue):
-                # 축구 경기 수가 더 많거나 같으면 축구 먼저
-                team_a, team_b = self.soccer_queue.pop(0)
-                score_a, score_b, events = await self.simulate_soccer(team_a, team_b)
-                await self.update_record(team_a, team_b, score_a, score_b, "축구")
-                await self.send_match_result(soccer_ch, "⚽", team_a, team_b, score_a, score_b, events)
-            else:
-                team_a, team_b = self.baseball_queue.pop(0)
-                score_a, score_b, events = await self.simulate_baseball(team_a, team_b)
-                await self.update_record(team_a, team_b, score_a, score_b, "야구")
-                await self.send_match_result(baseball_ch, "⚾", team_a, team_b, score_a, score_b, events)
-        elif self.soccer_queue:
-            team_a, team_b = self.soccer_queue.pop(0)
-            score_a, score_b, events = await self.simulate_soccer(team_a, team_b)
-            await self.update_record(team_a, team_b, score_a, score_b, "축구")
-            await self.send_match_result(soccer_ch, "⚽", team_a, team_b, score_a, score_b, events)
-        elif self.baseball_queue:
-            team_a, team_b = self.baseball_queue.pop(0)
-            score_a, score_b, events = await self.simulate_baseball(team_a, team_b)
-            await self.update_record(team_a, team_b, score_a, score_b, "야구")
-            await self.send_match_result(baseball_ch, "⚾", team_a, team_b, score_a, score_b, events)
-
-    @match_scheduler.before_loop
-    async def before_scheduler(self):
-        await self.bot.wait_until_ready()
-        # 봇 시작 시 시즌이 없으면 생성
-        if not self.season_active:
-            await self.generate_season()
-
-    # ═════════════════════════════════════════════════════════
     #  turn_passed 이벤트 수신 → 시즌 초기화
     # ═════════════════════════════════════════════════════════
     @commands.Cog.listener()
     async def on_turn_passed(self):
-        """경제 턴 넘기기 이벤트 수신 → 최종 랭킹 출력 + 시즌 리셋"""
+        """경제 턴 넘기기 이벤트 수신 → 최종 랭킹 출력 + 시즌 리셋 + 새 일정"""
+        await self.stop_runners()
         soccer_ch, baseball_ch = await self.get_channels()
 
         async with aiosqlite.connect(self.db) as db:
@@ -1217,8 +1274,177 @@ class SportsCog(commands.Cog):
             embed.set_footer(text="새 시즌이 시작됩니다!")
             await baseball_ch.send(embed=embed)
 
-        # ── 새 시즌 생성 ─────────────────────────────────
-        await self.generate_season()
+
+        # ── 새 시즌 일정 ────────────────────────────────
+        self.form.clear()
+        await self.start_season()
+        for sport, ch in (("축구", soccer_ch), ("야구", baseball_ch)):
+            if ch and self.schedule[sport]:
+                meta = SPORT_META[sport]
+                embed = discord.Embed(
+                    title=f"📅 {meta['league']} 새 시즌 개막!",
+                    description=self._schedule_summary(self.schedule[sport]),
+                    colour=0x2ECC71,
+                )
+                first = self.schedule[sport][0]
+                embed.add_field(name="개막전", value=f"**{first.home}** vs **{first.away}** · <t:{int(first.kickoff)}:R>")
+                await ch.send(embed=embed)
+
+    # ═════════════════════════════════════════════════════════
+    #  관리자 — 리그/선수 수치 조정
+    # ═════════════════════════════════════════════════════════
+    STAT_COLUMNS = {
+        "축구": {"스피드": "pace", "슈팅": "shooting", "패스": "passing", "드리블": "dribbling",
+                 "수비": "defending", "피지컬": "physical"},
+        "야구": {"컨택트": "contact", "파워": "power", "주루": "run", "송구": "arm", "수비": "field"},
+    }
+
+    @app_commands.command(name="전적수정", description="구단의 승/무/패/승점을 직접 수정합니다 (관리자)")
+    @app_commands.describe(구단명="대상 구단", 승="승 수", 무="무 수", 패="패 수", 승점="승점 (비우면 축구는 승×3+무, 야구는 승)")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def admin_set_record(self, interaction: discord.Interaction, 구단명: str, 승: int, 무: int, 패: int,
+                               승점: int = None):
+        async with aiosqlite.connect(self.db) as db:
+            cur = await db.execute("SELECT sport_type FROM sports_teams WHERE team_name = ?", (구단명,))
+            row = await cur.fetchone()
+            if not row:
+                return await interaction.response.send_message("❌ 해당 구단이 존재하지 않습니다.", ephemeral=True)
+            if 승점 is None:
+                승점 = 승 * 3 + 무 if row[0] == "축구" else 승
+            await db.execute(
+                "UPDATE sports_teams SET wins = ?, draws = ?, losses = ?, points = ? WHERE team_name = ?",
+                (승, 무, 패, 승점, 구단명),
+            )
+            await db.commit()
+        await interaction.response.send_message(f"✏️ **{구단명}** 전적 → {승}승 {무}무 {패}패 (승점 {승점})")
+
+    @app_commands.command(name="순위초기화", description="해당 종목 모든 구단의 이번 시즌 전적을 0으로 되돌립니다 (관리자)")
+    @app_commands.describe(종목="축구 또는 야구")
+    @app_commands.choices(종목=[
+        app_commands.Choice(name="축구", value="축구"),
+        app_commands.Choice(name="야구", value="야구"),
+    ])
+    @app_commands.checks.has_permissions(administrator=True)
+    async def admin_reset_standings(self, interaction: discord.Interaction, 종목: app_commands.Choice[str]):
+        async with aiosqlite.connect(self.db) as db:
+            cur = await db.execute(
+                "UPDATE sports_teams SET wins = 0, draws = 0, losses = 0, points = 0 WHERE sport_type = ?",
+                (종목.value,),
+            )
+            n = cur.rowcount
+            cur = await db.execute("SELECT team_name FROM sports_teams WHERE sport_type = ?", (종목.value,))
+            teams = [r[0] for r in await cur.fetchall()]
+            await db.commit()
+        for team in teams:
+            self.form.pop(team, None)
+        await interaction.response.send_message(f"🧹 {종목.value} {n}개 구단 전적과 기세를 초기화했습니다.")
+
+    async def _find_player(self, db, sport, name):
+        table = "soccer_players" if sport == "축구" else "baseball_players"
+        cur = await db.execute(f"SELECT * FROM {table} WHERE player_name = ?", (name,))
+        return table, await cur.fetchone()
+
+    @app_commands.command(name="선수능력치수정", description="선수 능력치를 수정합니다 (관리자)")
+    @app_commands.describe(종목="축구 또는 야구", 선수명="대상 선수",
+                           능력치="축구: 스피드/슈팅/패스/드리블/수비/피지컬 · 야구: 컨택트/파워/주루/송구/수비",
+                           값="새 값 (1~99)")
+    @app_commands.choices(종목=[
+        app_commands.Choice(name="축구", value="축구"),
+        app_commands.Choice(name="야구", value="야구"),
+    ])
+    @app_commands.checks.has_permissions(administrator=True)
+    async def admin_set_stat(self, interaction: discord.Interaction, 종목: app_commands.Choice[str],
+                             선수명: str, 능력치: str, 값: int):
+        cols = self.STAT_COLUMNS[종목.value]
+        if 능력치 not in cols:
+            return await interaction.response.send_message(
+                f"❌ {종목.value} 능력치는 {', '.join(cols)} 중 하나입니다.", ephemeral=True)
+        값 = max(1, min(99, 값))
+        async with aiosqlite.connect(self.db) as db:
+            db.row_factory = aiosqlite.Row
+            table, row = await self._find_player(db, 종목.value, 선수명)
+            if not row:
+                return await interaction.response.send_message("❌ 해당 선수를 찾을 수 없습니다.", ephemeral=True)
+            col = cols[능력치]
+            await db.execute(f"UPDATE {table} SET {col} = ? WHERE player_name = ?", (값, 선수명))
+            await db.commit()
+        await interaction.response.send_message(f"📝 **{선수명}** {능력치} {row[col]} → **{값}**")
+
+    @admin_set_stat.autocomplete("능력치")
+    async def _stat_autocomplete(self, interaction: discord.Interaction, current: str):
+        sport = getattr(interaction.namespace, "종목", None)
+        names = list(self.STAT_COLUMNS.get(sport, {})) or sorted(
+            set(self.STAT_COLUMNS["축구"]) | set(self.STAT_COLUMNS["야구"]))
+        return [app_commands.Choice(name=n, value=n) for n in names if current in n][:25]
+
+    @app_commands.command(name="선수몸값수정", description="선수의 기본 이적료(몸값)를 수정합니다 (관리자)")
+    @app_commands.describe(종목="축구 또는 야구", 선수명="대상 선수", 금액="새 기본 이적료 (물가 반영 전)")
+    @app_commands.choices(종목=[
+        app_commands.Choice(name="축구", value="축구"),
+        app_commands.Choice(name="야구", value="야구"),
+    ])
+    @app_commands.checks.has_permissions(administrator=True)
+    async def admin_set_fee(self, interaction: discord.Interaction, 종목: app_commands.Choice[str],
+                            선수명: str, 금액: int):
+        if 금액 < 0:
+            return await interaction.response.send_message("❌ 금액은 0 이상이어야 합니다.", ephemeral=True)
+        async with aiosqlite.connect(self.db) as db:
+            db.row_factory = aiosqlite.Row
+            table, row = await self._find_player(db, 종목.value, 선수명)
+            if not row:
+                return await interaction.response.send_message("❌ 해당 선수를 찾을 수 없습니다.", ephemeral=True)
+            await db.execute(f"UPDATE {table} SET base_transfer_fee = ? WHERE player_name = ?", (금액, 선수명))
+            await db.commit()
+        await interaction.response.send_message(
+            f"💰 **{선수명}** 몸값 {row['base_transfer_fee']:,} → **{금액:,}원**")
+
+    @app_commands.command(name="선수강제이적", description="선수를 원하는 구단(또는 무소속)으로 옮깁니다 — 비용 없음 (관리자)")
+    @app_commands.describe(종목="축구 또는 야구", 선수명="대상 선수", 구단명="이동할 구단 (무소속 가능)")
+    @app_commands.choices(종목=[
+        app_commands.Choice(name="축구", value="축구"),
+        app_commands.Choice(name="야구", value="야구"),
+    ])
+    @app_commands.checks.has_permissions(administrator=True)
+    async def admin_move_player(self, interaction: discord.Interaction, 종목: app_commands.Choice[str],
+                                선수명: str, 구단명: str):
+        async with aiosqlite.connect(self.db) as db:
+            db.row_factory = aiosqlite.Row
+            table, row = await self._find_player(db, 종목.value, 선수명)
+            if not row:
+                return await interaction.response.send_message("❌ 해당 선수를 찾을 수 없습니다.", ephemeral=True)
+            if 구단명 != "무소속":
+                cur = await db.execute(
+                    "SELECT 1 FROM sports_teams WHERE team_name = ? AND sport_type = ?", (구단명, 종목.value))
+                if not await cur.fetchone():
+                    return await interaction.response.send_message(
+                        f"❌ {종목.value} 구단 **{구단명}**이(가) 없습니다.", ephemeral=True)
+                cap = int(cfg.get(f"{종목.value}_최대선수"))
+                cur = await db.execute(f"SELECT COUNT(*) FROM {table} WHERE team_name = ?", (구단명,))
+                roster = (await cur.fetchone())[0]
+                if roster >= cap and row["team_name"] != 구단명:
+                    return await interaction.response.send_message(
+                        f"❌ **{구단명}** 선수단이 가득 찼습니다 ({roster}/{cap}명). "
+                        f"`/설정변경 {종목.value}_최대선수` 로 한도를 늘릴 수 있습니다.", ephemeral=True)
+            await db.execute(f"UPDATE {table} SET team_name = ? WHERE player_name = ?", (구단명, 선수명))
+            await db.commit()
+        await interaction.response.send_message(f"🔀 **{선수명}**: {row['team_name']} → **{구단명}**")
+
+    @app_commands.command(name="선수삭제", description="선수를 DB에서 삭제합니다 (관리자)")
+    @app_commands.describe(종목="축구 또는 야구", 선수명="삭제할 선수")
+    @app_commands.choices(종목=[
+        app_commands.Choice(name="축구", value="축구"),
+        app_commands.Choice(name="야구", value="야구"),
+    ])
+    @app_commands.checks.has_permissions(administrator=True)
+    async def admin_delete_player(self, interaction: discord.Interaction, 종목: app_commands.Choice[str], 선수명: str):
+        table = "soccer_players" if 종목.value == "축구" else "baseball_players"
+        async with aiosqlite.connect(self.db) as db:
+            cur = await db.execute(f"DELETE FROM {table} WHERE player_name = ?", (선수명,))
+            n = cur.rowcount
+            await db.commit()
+        if not n:
+            return await interaction.response.send_message("❌ 해당 선수를 찾을 수 없습니다.", ephemeral=True)
+        await interaction.response.send_message(f"🗑️ {종목.value} 선수 **{선수명}** 삭제 완료")
 
     # ═════════════════════════════════════════════════════════
     #  선수 검색 및 비교

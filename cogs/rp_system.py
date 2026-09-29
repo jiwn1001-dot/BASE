@@ -475,7 +475,7 @@ class RPSystemCog(commands.Cog):
     # ═════════════════════════════════════════════════════════
     #  RP 프로필 등록
     # ═════════════════════════════════════════════════════════
-    @app_commands.command(name="RP프로필등록", description="RP 캐릭터 프로필을 등록합니다")
+    @app_commands.command(name="rp프로필등록", description="RP 캐릭터 프로필을 등록합니다")
     @app_commands.describe(이름="RP 캐릭터 이름", 프로필이미지="프로필 이미지 URL")
     async def register_rp_profile(
         self, interaction: discord.Interaction, 이름: str, 프로필이미지: str
