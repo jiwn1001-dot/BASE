@@ -161,6 +161,7 @@ class SportsCog(commands.Cog):
 
     async def cog_load(self):
         await cfg.load(self.db)
+        await self._init_season_tables()
         self._boot_task = asyncio.create_task(self._boot())
 
     async def _boot(self):
@@ -758,6 +759,11 @@ class SportsCog(commands.Cog):
                 traceback.print_exc()
             finally:
                 self.live[sport] = None
+        # 오늘 일정 전부 소화 → 자정 전에 최종 결산
+        try:
+            await self.settle_season(sport)
+        except Exception:
+            traceback.print_exc()
 
     async def _teams_exist(self, fx):
         async with aiosqlite.connect(self.db) as db:
@@ -887,6 +893,7 @@ class SportsCog(commands.Cog):
 
         s1, s2 = match.score
         await self.update_record(first, second, s1, s2, fx.sport)
+        await self._record_match_stats(fx, match, first, second)
         for team, mine, theirs in ((first, s1, s2), (second, s2, s1)):
             self.form.setdefault(team, []).append("W" if mine > theirs else "L" if mine < theirs else "D")
             self.form[team] = self.form[team][-10:]
@@ -1204,79 +1211,19 @@ class SportsCog(commands.Cog):
     # ═════════════════════════════════════════════════════════
     @commands.Cog.listener()
     async def on_turn_passed(self):
-        """경제 턴 넘기기 이벤트 수신 → 최종 랭킹 출력 + 시즌 리셋 + 새 일정"""
+        """00시 턴 넘기기 → (미결산 시) 결산 → 기록 초기화 → 새 일정"""
         await self.stop_runners()
         soccer_ch, baseball_ch = await self.get_channels()
 
-        async with aiosqlite.connect(self.db) as db:
-            db.row_factory = aiosqlite.Row
-
-            # ── 축구 최종 랭킹 ────────────────────────────
-            cur = await db.execute(
-                """SELECT team_name, wins, draws, losses, points
-                   FROM sports_teams WHERE sport_type = '축구'
-                   ORDER BY points DESC, wins DESC"""
-            )
-            soccer_rank = await cur.fetchall()
-
-            # ── 야구 최종 랭킹 ────────────────────────────
-            cur = await db.execute(
-                """SELECT team_name, wins, draws, losses, points
-                   FROM sports_teams WHERE sport_type = '야구'
-                   ORDER BY wins DESC, losses ASC"""
-            )
-            baseball_rank = await cur.fetchall()
-
-            # ── 전적 초기화 ──────────────────────────────
-            await db.execute(
-                "UPDATE sports_teams SET wins = 0, draws = 0, losses = 0, points = 0"
-            )
-            await db.commit()
-
-        # ── 축구 랭킹 Embed ────────────────────────────
-        if soccer_rank and soccer_ch:
-            lines = []
-            medals = ["🥇", "🥈", "🥉"]
-            for i, r in enumerate(soccer_rank):
-                medal = medals[i] if i < 3 else f"**{i+1}.**"
-                total = r["wins"] + r["draws"] + r["losses"]
-                lines.append(
-                    f"{medal} **{r['team_name']}** — "
-                    f"{r['wins']}승 {r['draws']}무 {r['losses']}패 "
-                    f"({r['points']}점) [{total}경기]"
-                )
-            embed = discord.Embed(
-                title="⚽ K리그 시즌 최종 순위",
-                description="\n".join(lines),
-                colour=0xF1C40F,
-            )
-            embed.set_footer(text="새 시즌이 시작됩니다!")
-            await soccer_ch.send(embed=embed)
-
-        # ── 야구 랭킹 Embed ────────────────────────────
-        if baseball_rank and baseball_ch:
-            lines = []
-            medals = ["🥇", "🥈", "🥉"]
-            for i, r in enumerate(baseball_rank):
-                medal = medals[i] if i < 3 else f"**{i+1}.**"
-                total = r["wins"] + r["losses"]
-                win_rate = r["wins"] / max(total, 1)
-                lines.append(
-                    f"{medal} **{r['team_name']}** — "
-                    f"{r['wins']}승 {r['losses']}패 "
-                    f"(승률 {win_rate:.3f}) [{total}경기]"
-                )
-            embed = discord.Embed(
-                title="⚾ KBO 시즌 최종 순위",
-                description="\n".join(lines),
-                colour=0xF1C40F,
-            )
-            embed.set_footer(text="새 시즌이 시작됩니다!")
-            await baseball_ch.send(embed=embed)
-
+        # 마지막 경기 직후 결산이 안 됐으면(서버 재시작 등) 지금 결산
+        for sport in SPORT_META:
+            try:
+                await self.settle_season(sport)
+            except Exception:
+                traceback.print_exc()
+        await self.reset_season_records()
 
         # ── 새 시즌 일정 ────────────────────────────────
-        self.form.clear()
         await self.start_season()
         for sport, ch in (("축구", soccer_ch), ("야구", baseball_ch)):
             if ch and self.schedule[sport]:
@@ -1289,6 +1236,241 @@ class SportsCog(commands.Cog):
                 first = self.schedule[sport][0]
                 embed.add_field(name="개막전", value=f"**{first.home}** vs **{first.away}** · <t:{int(first.kickoff)}:R>")
                 await ch.send(embed=embed)
+
+    # ═════════════════════════════════════════════════════════
+    #  시즌 기록 · 최종 결산
+    # ═════════════════════════════════════════════════════════
+    async def _init_season_tables(self):
+        async with aiosqlite.connect(self.db) as db:
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS season_player_stats (
+                    sport TEXT, player_name TEXT, team_name TEXT,
+                    goals INTEGER DEFAULT 0, assists INTEGER DEFAULT 0,
+                    hr INTEGER DEFAULT 0, rbi INTEGER DEFAULT 0, hits INTEGER DEFAULT 0, so INTEGER DEFAULT 0,
+                    PRIMARY KEY (sport, player_name)
+                )
+            """)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS season_state (
+                    sport TEXT PRIMARY KEY, settled INTEGER DEFAULT 0,
+                    games INTEGER DEFAULT 0, total_score INTEGER DEFAULT 0,
+                    best_margin INTEGER DEFAULT -1, best_text TEXT
+                )
+            """)
+            for sport in SPORT_META:
+                await db.execute("INSERT OR IGNORE INTO season_state (sport) VALUES (?)", (sport,))
+            await db.commit()
+
+    async def _record_match_stats(self, fx, match, first, second):
+        """경기 기록을 시즌 개인 기록 / 시즌 요약에 누적"""
+        stats: dict[str, dict] = {}
+
+        def bump(name, team, **kw):
+            d = stats.setdefault(name, {"team": team, "goals": 0, "assists": 0, "hr": 0, "rbi": 0, "hits": 0, "so": 0})
+            for k, v in kw.items():
+                d[k] += v
+
+        if fx.sport == "축구":
+            names = (fx.home, fx.away)
+            for e in match.events:
+                if e.kind == "goal":
+                    bump(e.scorer, names[e.team], goals=1)
+                    if e.assist:
+                        bump(e.assist, names[e.team], assists=1)
+        else:
+            names = (fx.away, fx.home)   # 초 = 원정 공격
+            for e in match.events:
+                if e.kind != "pa":
+                    continue
+                bat, fld = (names[0], names[1]) if e.top else (names[1], names[0])
+                bump(e.batter, bat, hits=1 if e.hit else 0, hr=1 if e.res == "HR" else 0,
+                     rbi=e.runs if e.res != "E" else 0)
+                if e.res == "K" and e.pitcher:
+                    bump(e.pitcher, fld, so=1)
+
+        s1, s2 = match.score
+        margin = abs(s1 - s2)
+        async with aiosqlite.connect(self.db) as db:
+            for name, d in stats.items():
+                await db.execute("""
+                    INSERT INTO season_player_stats (sport, player_name, team_name, goals, assists, hr, rbi, hits, so)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(sport, player_name) DO UPDATE SET
+                        team_name = excluded.team_name,
+                        goals = goals + excluded.goals, assists = assists + excluded.assists,
+                        hr = hr + excluded.hr, rbi = rbi + excluded.rbi,
+                        hits = hits + excluded.hits, so = so + excluded.so
+                """, (fx.sport, name, d["team"], d["goals"], d["assists"], d["hr"], d["rbi"], d["hits"], d["so"]))
+            await db.execute(
+                "UPDATE season_state SET games = games + 1, total_score = total_score + ? WHERE sport = ?",
+                (s1 + s2, fx.sport))
+            await db.execute(
+                "UPDATE season_state SET best_margin = ?, best_text = ? WHERE sport = ? AND best_margin < ?",
+                (margin, f"{fx.round}R {first} {s1} : {s2} {second}", fx.sport, margin))
+            await db.commit()
+
+    AWARDS = {
+        "축구": [("⚽ 득점왕", "goals", "골"), ("🎯 도움왕", "assists", "도움")],
+        "야구": [("💥 홈런왕", "hr", "홈런"), ("🏏 타점왕", "rbi", "타점"),
+                 ("🔥 최다안타", "hits", "안타"), ("🎯 탈삼진왕", "so", "탈삼진")],
+    }
+    MVP_SCORE = {
+        "축구": "goals * 3 + assists * 2",
+        "야구": "hr * 4 + rbi * 1.5 + hits + so * 0.7",
+    }
+
+    async def _leaders(self, sport, limit=1):
+        """{부문명: [(선수, 팀, 기록), ...]}"""
+        out = {}
+        async with aiosqlite.connect(self.db) as db:
+            for title, col, unit in self.AWARDS[sport]:
+                cur = await db.execute(
+                    f"""SELECT player_name, team_name, {col} FROM season_player_stats
+                        WHERE sport = ? AND {col} > 0 ORDER BY {col} DESC, player_name LIMIT ?""",
+                    (sport, limit))
+                out[(title, unit)] = await cur.fetchall()
+            cur = await db.execute(
+                f"""SELECT player_name, team_name, goals, assists, hr, rbi, hits, so
+                    FROM season_player_stats WHERE sport = ?
+                    ORDER BY {self.MVP_SCORE[sport]} DESC LIMIT 1""", (sport,))
+            out["mvp"] = await cur.fetchone()
+        return out
+
+    @staticmethod
+    def _mvp_line(sport, r):
+        if not r:
+            return None
+        name, team, g, a, hr, rbi, h, so = r
+        if sport == "축구":
+            stat = f"{g}골 {a}도움"
+        else:
+            parts = [f"{h}안타 {hr}홈런 {rbi}타점"] if h or hr or rbi else []
+            if so:
+                parts.append(f"{so}탈삼진")
+            stat = " · ".join(parts)
+        return f"**{name}** ({team}) — {stat}"
+
+    async def settle_season(self, sport, force_channel=None):
+        """
+        시즌 최종 결산: 최종 순위 · 우승 · 개인 타이틀 · 시즌 기록 · 순위별 상금 지급.
+        같은 시즌에 두 번 실행되지 않음 (season_state.settled).
+        반환: 결산했으면 True
+        """
+        async with aiosqlite.connect(self.db) as db:
+            cur = await db.execute(
+                "SELECT settled, games, total_score, best_text FROM season_state WHERE sport = ?", (sport,))
+            state = await cur.fetchone()
+        if not state or state[0]:
+            return False
+        _, games, total_score, best_text = state
+        standings = await self._standings(sport)
+        meta = SPORT_META[sport]
+
+        # ── 상금 (순위 제곱 가중치로 차등) ──
+        pool = int(cfg.get("경기_상금총액"))
+        ordered = sorted(standings.items(), key=lambda kv: kv[1][0])
+        n = len(ordered)
+        weights = [(n - i) ** 2 for i in range(n)]
+        prizes = {team: int(pool * w / sum(weights)) if weights else 0 for (team, _), w in zip(ordered, weights)}
+
+        async with aiosqlite.connect(self.db) as db:
+            if pool > 0 and games > 0:
+                for team, (_, row) in ordered:
+                    await db.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (row["owner_id"],))
+                    await db.execute("UPDATE users SET money = money + ? WHERE user_id = ?",
+                                     (prizes[team], row["owner_id"]))
+            await db.execute("UPDATE season_state SET settled = 1 WHERE sport = ?", (sport,))
+            await db.commit()
+
+        ch = force_channel or await self.get_channel_for(sport)
+        if not ch or not ordered or (games == 0 and not force_channel):
+            return True  # 채널이 없거나 경기가 한 번도 없었으면 발표 생략
+
+        champ, (_, champ_row) = ordered[0]
+        embed = discord.Embed(
+            title=f"🏆 {meta['league']} 시즌 최종 결산",
+            description=(f"## 👑 우승: {champ}\n구단주 <@{champ_row['owner_id']}> · "
+                         f"{self._record_str(sport, champ_row)}"),
+            colour=0xF1C40F,
+        )
+        medals = ["🥇", "🥈", "🥉"]
+        lines = []
+        for i, (team, (rank, row)) in enumerate(ordered):
+            medal = medals[i] if i < 3 else f"**{rank}.**"
+            prize = f" · 💰{prizes[team]:,}원" if pool > 0 and games > 0 else ""
+            lines.append(f"{medal} **{team}** {self._record_str(sport, row)}{prize}")
+        chunk, part = [], 1
+        for line in lines:
+            if len("\n".join(chunk + [line])) > 1000:
+                embed.add_field(name=f"📋 최종 순위 ({part})", value="\n".join(chunk), inline=False)
+                chunk, part = [], part + 1
+            chunk.append(line)
+        if chunk:
+            embed.add_field(name="📋 최종 순위" + (f" ({part})" if part > 1 else ""), value="\n".join(chunk), inline=False)
+
+        leaders = await self._leaders(sport)
+        award_lines = []
+        mvp = self._mvp_line(sport, leaders.pop("mvp"))
+        if mvp:
+            award_lines.append(f"⭐ **시즌 MVP** {mvp}")
+        for (title, unit), rows in leaders.items():
+            if rows:
+                name, team, val = rows[0]
+                award_lines.append(f"{title} **{name}** ({team}) — {val}{unit}")
+        if award_lines:
+            embed.add_field(name="🎖️ 개인 타이틀", value="\n".join(award_lines), inline=False)
+
+        unit = "골" if sport == "축구" else "점"
+        summary = f"총 **{games}경기** · 경기당 평균 **{total_score / max(games, 1):.2f}{unit}**"
+        if best_text:
+            summary += f"\n최다 점수차: {best_text}"
+        embed.add_field(name="📊 시즌 기록", value=summary, inline=False)
+        embed.set_footer(text="00시에 전적이 초기화되고 새 시즌이 개막합니다!")
+        await ch.send(embed=embed)
+        return True
+
+    async def reset_season_records(self):
+        async with aiosqlite.connect(self.db) as db:
+            await db.execute("UPDATE sports_teams SET wins = 0, draws = 0, losses = 0, points = 0")
+            await db.execute("DELETE FROM season_player_stats")
+            await db.execute(
+                "UPDATE season_state SET settled = 0, games = 0, total_score = 0, best_margin = -1, best_text = NULL")
+            await db.commit()
+        self.form.clear()
+
+    @app_commands.command(name="시즌결산", description="지금 바로 시즌 최종 결산(순위·타이틀·상금)을 발표합니다 (관리자)")
+    @app_commands.describe(종목="축구 또는 야구")
+    @app_commands.choices(종목=[
+        app_commands.Choice(name="축구", value="축구"),
+        app_commands.Choice(name="야구", value="야구"),
+    ])
+    @app_commands.checks.has_permissions(administrator=True)
+    async def admin_settle(self, interaction: discord.Interaction, 종목: app_commands.Choice[str]):
+        await interaction.response.defer()
+        ch = await self.get_channel_for(종목.value) or interaction.channel
+        done = await self.settle_season(종목.value, force_channel=ch)
+        if not done:
+            return await interaction.followup.send("ℹ️ 이번 시즌은 이미 결산되었습니다. (00시에 새 시즌 시작)")
+        await interaction.followup.send(f"✅ {종목.value} 시즌 결산 완료 → {ch.mention}")
+
+    @app_commands.command(name="개인순위", description="이번 시즌 개인 기록 순위를 봅니다")
+    @app_commands.describe(종목="축구 또는 야구")
+    @app_commands.choices(종목=[
+        app_commands.Choice(name="축구", value="축구"),
+        app_commands.Choice(name="야구", value="야구"),
+    ])
+    async def player_leaders(self, interaction: discord.Interaction, 종목: app_commands.Choice[str]):
+        sport = 종목.value
+        leaders = await self._leaders(sport, limit=5)
+        mvp = self._mvp_line(sport, leaders.pop("mvp"))
+        embed = discord.Embed(title=f"{SPORT_META[sport]['emoji']} {SPORT_META[sport]['league']} 개인 순위",
+                              colour=0x9B59B6)
+        if mvp:
+            embed.add_field(name="⭐ MVP 레이스 1위", value=mvp, inline=False)
+        for (title, unit), rows in leaders.items():
+            value = "\n".join(f"`{i}.` **{n}** ({t}) {v}{unit}" for i, (n, t, v) in enumerate(rows, 1))
+            embed.add_field(name=title, value=value or "기록 없음", inline=True)
+        await interaction.response.send_message(embed=embed)
 
     # ═════════════════════════════════════════════════════════
     #  관리자 — 리그/선수 수치 조정

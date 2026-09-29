@@ -76,6 +76,7 @@ class SoccerEvent:
     on_target: tuple = (0, 0)
     poss: float = 50.0       # 홈 점유율(%)
     scorer: str | None = None
+    assist: str | None = None
 
 
 @dataclass
@@ -322,12 +323,13 @@ def simulate_soccer(home, away, home_players, away_players, rng=None, tune=None,
                     score[i] += 1
                     others = [x for x in active[i] if x is not shooter]
                     text = f"⚽ {label} | " + rng.choice(GOAL_TEXTS).format(p=p)
+                    assist = None
                     if others and rng.random() < 0.75:
-                        a = _pick(rng, others, lambda x: (x["passing"] / 50) ** 3)
-                        text += " — " + rng.choice(ASSIST_TEXTS).format(a=a["player_name"])
+                        assist = _pick(rng, others, lambda x: (x["passing"] / 50) ** 3)["player_name"]
+                        text += " — " + rng.choice(ASSIST_TEXTS).format(a=assist)
                     add(m, half, label, "goal", text, i,
                         buildup=bu or f"⚡ {label} | **{p}**의 슈팅…!",
-                        scorer=p, alert=_goal_alert(label, names, score, i, p, m))
+                        scorer=p, assist=assist, alert=_goal_alert(label, names, score, i, p, m))
                 elif r < xg + (1 - xg) * 0.33:
                     on_t[i] += 1
                     add(m, half, label, "save", _lbl(label, rng.choice(SAVE_TEXTS).format(p=p, g=g)), i, buildup=bu)
@@ -414,6 +416,7 @@ class BaseballEvent:
     runs: int = 0            # 이 이벤트로 공격팀이 낸 점수
     hit: bool = False
     batter: str | None = None
+    res: str | None = None   # 타석 결과 코드: K BB HBP 1B 2B 3B HR E OUT
     pitcher: str | None = None
     pitches: int = 0         # 현재 투수 투구수
     buildup: str | None = None
@@ -755,7 +758,7 @@ def simulate_baseball(away, home, away_players, home_players, rng=None, tune=Non
                 buildup = f"⚡ {tag} | **{b}**, 받아칩니다…!!"
 
             add("pa", text, inning, top, outs, bases, runs=runs, hit=hit, batter=b, pitcher=pn,
-                pitches=pit[dk]["pc"], buildup=buildup, alert=alert)
+                pitches=pit[dk]["pc"], res=res, buildup=buildup, alert=alert)
             if walkoff:
                 return True
         return False

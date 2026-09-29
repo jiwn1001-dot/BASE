@@ -7,6 +7,8 @@ import discord
 from discord.ext import commands, tasks
 from discord import app_commands
 import aiosqlite
+import asyncio
+import io
 import random
 import math
 import time
@@ -77,6 +79,22 @@ def trade_fill(price: float, qty: int, total_shares: int, buy: bool):
     if buy:
         return price * (math.exp(x) - 1) / x, price * math.exp(x)
     return price * (1 - math.exp(-x)) / x, price * math.exp(-x)
+
+
+CHART_PERIODS = {"6시간": 6 * 3600, "24시간": 86400, "3일": 3 * 86400, "7일": 7 * 86400}
+HISTORY_DAYS = 7
+
+
+async def company_autocomplete(interaction: discord.Interaction, current: str):
+    """기업명 자동완성 — 현재가와 등락률을 같이 보여줌"""
+    async with aiosqlite.connect(interaction.client.db_path) as db:
+        cur = await db.execute(
+            """SELECT company_name, current_price, day_open FROM stocks
+               WHERE company_name LIKE ? ORDER BY current_price * total_shares DESC LIMIT 25""",
+            (f"%{current}%",))
+        rows = await cur.fetchall()
+    return [app_commands.Choice(name=f"{n} · {p:,}원 {change_str(p, o or p)}"[:100], value=n)
+            for n, p, o in rows]
 
 
 class EconomyCog(commands.Cog):
@@ -414,6 +432,7 @@ class EconomyCog(commands.Cog):
     # ═════════════════════════════════════════════════════════
     @app_commands.command(name="대주주지분설정", description="대주주 보유량을 조정해 시장 유통 물량을 풀거나 거둡니다 (관리자)")
     @app_commands.describe(기업명="대상 기업", 지분퍼센트="대주주 지분 % (예: 40 → 나머지 중 미보유분이 시장 물량)")
+    @app_commands.autocomplete(기업명=company_autocomplete)
     @app_commands.checks.has_permissions(administrator=True)
     async def set_owner_stake(self, interaction: discord.Interaction, 기업명: str, 지분퍼센트: float):
         if not 0 <= 지분퍼센트 <= 100:
@@ -447,6 +466,7 @@ class EconomyCog(commands.Cog):
     # ═════════════════════════════════════════════════════════
     @app_commands.command(name="기업삭제", description="기업을 시장에서 상장 폐지(삭제)합니다 (관리자)")
     @app_commands.describe(기업명="삭제할 기업 이름")
+    @app_commands.autocomplete(기업명=company_autocomplete)
     @app_commands.checks.has_permissions(administrator=True)
     async def delete_company(self, interaction: discord.Interaction, 기업명: str):
         async with aiosqlite.connect(self.db) as db:
@@ -471,6 +491,7 @@ class EconomyCog(commands.Cog):
     # ═════════════════════════════════════════════════════════
     @app_commands.command(name="주가강제조정", description="특정 기업 주가를 강제 변경합니다 (관리자)")
     @app_commands.describe(기업명="대상 기업", 새로운주가="새로 설정할 주가")
+    @app_commands.autocomplete(기업명=company_autocomplete)
     @app_commands.checks.has_permissions(administrator=True)
     async def force_price(
         self, interaction: discord.Interaction, 기업명: str, 새로운주가: int
@@ -507,6 +528,7 @@ class EconomyCog(commands.Cog):
     # ═════════════════════════════════════════════════════════
     @app_commands.command(name="기업상황설정", description="기업별 경기 단계를 설정합니다 (관리자)")
     @app_commands.describe(기업명="대상 기업", 경기단계1_5="1~5 사이의 경기 단계")
+    @app_commands.autocomplete(기업명=company_autocomplete)
     @app_commands.checks.has_permissions(administrator=True)
     async def set_phase(
         self, interaction: discord.Interaction, 기업명: str, 경기단계1_5: int
@@ -574,78 +596,106 @@ class EconomyCog(commands.Cog):
         await interaction.response.send_message(embed=embed)
 
     # ═════════════════════════════════════════════════════════
-    #  주가 확인
+    #  주가 확인 (차트)
     # ═════════════════════════════════════════════════════════
-    @app_commands.command(name="주가확인", description="특정 기업이나 전체 주식 시장의 현재 주가를 확인합니다")
-    @app_commands.describe(기업명="확인할 기업 이름 (선택사항)")
-    async def check_price(self, interaction: discord.Interaction, 기업명: str = None):
+    @app_commands.command(name="주가확인", description="기업 주가와 주가 변동 그래프를 봅니다 (기업명 비우면 종합지수)")
+    @app_commands.describe(기업명="확인할 기업 (입력하면 자동완성, 비우면 전체 시장)", 기간="그래프 기간 (기본 24시간)")
+    @app_commands.choices(기간=[app_commands.Choice(name=k, value=k) for k in CHART_PERIODS])
+    @app_commands.autocomplete(기업명=company_autocomplete)
+    async def check_price(self, interaction: discord.Interaction, 기업명: str = None,
+                          기간: app_commands.Choice[str] = None):
+        period = 기간.value if 기간 else "24시간"
+        since = int(time.time()) - CHART_PERIODS[period]
+        await interaction.response.defer()
         async with aiosqlite.connect(self.db) as db:
             db.row_factory = aiosqlite.Row
             if 기업명:
                 cur = await db.execute("SELECT * FROM stocks WHERE company_name = ?", (기업명,))
                 row = await cur.fetchone()
                 if not row:
-                    return await interaction.response.send_message("❌ 해당 기업이 존재하지 않습니다.", ephemeral=True)
-                since = int(time.time()) - 86400
+                    return await interaction.followup.send("❌ 해당 기업이 존재하지 않습니다.")
                 cur = await db.execute(
-                    "SELECT price FROM stock_history WHERE company_name = ? AND ts >= ? ORDER BY ts",
-                    (기업명, since),
-                )
-                hist = [r["price"] for r in await cur.fetchall()]
+                    "SELECT ts, price FROM stock_history WHERE company_name = ? AND ts >= ? ORDER BY ts",
+                    (기업명, since))
+                hist = [(r["ts"], r["price"]) for r in await cur.fetchall()]
                 available = await float_available(db, 기업명)
-
+                cur = await db.execute(
+                    "SELECT quantity FROM stock_holdings WHERE user_id = ? AND company_name = ?",
+                    (interaction.user.id, 기업명))
+                mine = await cur.fetchone()
             else:
                 cur = await db.execute("SELECT * FROM stocks ORDER BY current_price * total_shares DESC")
                 rows = await cur.fetchall()
+                # 종합지수 추이: 시점별 시가총액 합
+                cur = await db.execute(
+                    """SELECT h.ts, SUM(h.price * s.total_shares) FROM stock_history h
+                       JOIN stocks s ON s.company_name = h.company_name
+                       WHERE h.ts >= ? GROUP BY h.ts ORDER BY h.ts""", (since,))
+                caps = await cur.fetchall()
 
+        now = int(time.time())
         if 기업명:
             price = row["current_price"]
             open_ = row["day_open"] or price
-            market_cap = price * row["total_shares"]
-            hist = hist + [price]
+            hist.append((now, price))
+            prices = [p for _, p in hist]
+            start = prices[0]
+            up = price >= open_
             embed = discord.Embed(
-                title=f"🏢 {row['company_name']} 주가 정보",
-                description=f"## {price:,}원 {change_str(price, open_)}\n`{sparkline(hist)}`",
-                colour=0xE74C3C if price >= open_ else 0x3498DB,
+                title=f"🏢 {row['company_name']} ({row['sector_name']})",
+                description=(f"## {price:,}원 {change_str(price, open_)}\n"
+                             f"{period} 변동 {change_str(price, start)} · 고가 {max(prices):,} · 저가 {min(prices):,}"),
+                colour=0xE74C3C if up else 0x3498DB,
             )
             lo_lim, hi_lim = limit_band(open_)
-            embed.add_field(name="오늘 고가 / 저가", value=f"{max(hist):,} / {min(hist):,}원", inline=True)
-            embed.add_field(name="기준가 (상/하한가)", value=f"{open_:,}원 ({hi_lim:,} / {lo_lim:,})", inline=True)
-            embed.add_field(name="시가총액", value=f"{market_cap:,}원", inline=True)
-            embed.add_field(name="발행 주식 수", value=f"{row['total_shares']:,}주", inline=True)
-            embed.add_field(name="시장 잔여 물량", value=f"{available:,}주", inline=True)
-            embed.add_field(name="섹터", value=row["sector_name"], inline=True)
+            embed.add_field(name="기준가 (상/하한가)", value=f"{open_:,}원\n({hi_lim:,} / {lo_lim:,})", inline=True)
+            embed.add_field(name="시가총액", value=f"{price * row['total_shares']:,}원", inline=True)
+            embed.add_field(name="주식 수", value=f"발행 {row['total_shares']:,}주\n시장 잔여 {available:,}주", inline=True)
             embed.add_field(name="경기 상황", value=phase_text(row["economic_phase"]), inline=False)
-            embed.set_footer(text=f"최근 24시간 · {cfg.fmt(cfg.get('주식_틱간격분'))}분마다 시세 변동")
-            return await interaction.response.send_message(embed=embed)
-
-        if not rows:
-            return await interaction.response.send_message("📭 상장된 기업이 없습니다.", ephemeral=True)
-        lines = []
-        for r in rows[:30]:
-            pe = PHASES.get(r["economic_phase"], PHASES[3])[1]
-            lines.append(
-                f"{pe} **{r['company_name']}** {r['current_price']:,}원 "
-                f"{change_str(r['current_price'], r['day_open'] or r['current_price'])}"
+            if mine:
+                embed.add_field(name="💼 내 보유", value=f"{mine[0]:,}주 · 평가액 {mine[0] * price:,}원", inline=False)
+            chart = await asyncio.to_thread(render_chart, hist, open_, "KRW")
+        else:
+            if not rows:
+                return await interaction.followup.send("📭 상장된 기업이 없습니다.")
+            idx = market_index(rows)
+            lines = []
+            for r in rows[:25]:
+                pe = PHASES.get(r["economic_phase"], PHASES[3])[1]
+                lines.append(f"{pe} **{r['company_name']}** {r['current_price']:,}원 "
+                             f"{change_str(r['current_price'], r['day_open'] or r['current_price'])}")
+            embed = discord.Embed(
+                title="📈 전체 주식 시장 현황",
+                description=f"## 종합지수 {idx:.2f} ({(idx / 1000 - 1) * 100:+.2f}%)\n" + "\n".join(lines),
+                colour=0xE74C3C if idx >= 1000 else 0x3498DB,
             )
-        embed = discord.Embed(
-            title="📈 전체 주식 시장 현황",
-            description="\n".join(lines),
-            colour=0x3498DB,
-        )
-        embed.set_footer(text=f"종합지수 {market_index(rows):.2f} · 등락률은 오늘 기준가 대비")
-        await interaction.response.send_message(embed=embed)
+            # 시가총액 추이를 오늘 기준가 대비 지수로 환산
+            base = sum((r["day_open"] or r["current_price"]) * r["total_shares"] for r in rows) or 1
+            series = [(ts, 1000 * cap / base) for ts, cap in caps]
+            series.append((now, idx))
+            chart = await asyncio.to_thread(render_chart, series, 1000.0, "INDEX")
+        embed.set_footer(text=f"{period} · {cfg.fmt(cfg.get('주식_틱간격분'))}분마다 시세 변동 · 등락률은 오늘 기준가 대비")
+
+        if chart:
+            embed.set_image(url="attachment://chart.png")
+            await interaction.followup.send(embed=embed, file=discord.File(chart, filename="chart.png"))
+        else:
+            vals = [v for _, v in (hist if 기업명 else series)]
+            embed.add_field(name="📉 추이", value=f"`{sparkline(vals)}`", inline=False)
+            await interaction.followup.send(embed=embed)
 
     # ═════════════════════════════════════════════════════════
     #  매수 / 매도
     # ═════════════════════════════════════════════════════════
     @app_commands.command(name="매수", description="주식을 매수합니다")
     @app_commands.describe(기업명="매수할 기업", 수량="매수할 주식 수")
+    @app_commands.autocomplete(기업명=company_autocomplete)
     async def buy_stock(self, interaction: discord.Interaction, 기업명: str, 수량: int):
         await self._trade(interaction, 기업명, 수량, buy=True)
 
     @app_commands.command(name="매도", description="주식을 매도합니다")
     @app_commands.describe(기업명="매도할 기업", 수량="매도할 주식 수")
+    @app_commands.autocomplete(기업명=company_autocomplete)
     async def sell_stock(self, interaction: discord.Interaction, 기업명: str, 수량: int):
         await self._trade(interaction, 기업명, 수량, buy=False)
 
@@ -813,7 +863,7 @@ class EconomyCog(commands.Cog):
                 await db.execute(
                     "INSERT INTO stock_history (company_name, ts, price) VALUES (?, ?, ?)", (name, now, new_int)
                 )
-            await db.execute("DELETE FROM stock_history WHERE ts < ?", (now - 3 * 86400,))
+            await db.execute("DELETE FROM stock_history WHERE ts < ?", (now - HISTORY_DAYS * 86400,))
             await db.commit()
 
         self.tick_count += 1
@@ -861,6 +911,7 @@ class EconomyCog(commands.Cog):
     @app_commands.command(name="뉴스발생", description="특정 기업에 호재/악재 뉴스를 터뜨립니다 (관리자)")
     @app_commands.describe(기업명="대상 기업", 변동퍼센트="주가 영향 % (예: 8 또는 -12)", 내용="뉴스 제목 (비우면 자동 생성)",
                            지속="true면 적정가도 같이 이동(장기 영향), false면 일시적 충격")
+    @app_commands.autocomplete(기업명=company_autocomplete)
     @app_commands.checks.has_permissions(administrator=True)
     async def admin_news(self, interaction: discord.Interaction, 기업명: str, 변동퍼센트: float,
                          내용: str = None, 지속: bool = True):
@@ -926,6 +977,7 @@ class EconomyCog(commands.Cog):
 
     @app_commands.command(name="적정가설정", description="기업의 적정가(주가가 서서히 수렴할 목표)를 설정합니다 (관리자)")
     @app_commands.describe(기업명="대상 기업", 적정가="목표 가격")
+    @app_commands.autocomplete(기업명=company_autocomplete)
     @app_commands.checks.has_permissions(administrator=True)
     async def set_fair_value(self, interaction: discord.Interaction, 기업명: str, 적정가: int):
         if 적정가 <= 0:
@@ -943,6 +995,7 @@ class EconomyCog(commands.Cog):
     @app_commands.command(name="유상증자", description="신주를 발행해 대주주에게 지급합니다 — 주가는 희석됩니다 (관리자)")
     @app_commands.describe(기업명="대상 기업", 발행수량="새로 발행할 주식 수",
                            시장공급="true면 신주를 대주주 대신 시장 유통 물량으로 풉니다")
+    @app_commands.autocomplete(기업명=company_autocomplete)
     @app_commands.checks.has_permissions(administrator=True)
     async def issue_shares(self, interaction: discord.Interaction, 기업명: str, 발행수량: int,
                            시장공급: bool = False):
@@ -973,6 +1026,7 @@ class EconomyCog(commands.Cog):
 
     @app_commands.command(name="주식지급", description="시장 물량에서 유저에게 주식을 지급하거나 회수합니다 (관리자)")
     @app_commands.describe(유저="대상 유저", 기업명="기업", 수량="지급 수량 (음수면 회수)")
+    @app_commands.autocomplete(기업명=company_autocomplete)
     @app_commands.checks.has_permissions(administrator=True)
     async def grant_shares(self, interaction: discord.Interaction, 유저: discord.Member, 기업명: str, 수량: int):
         await self.bot.ensure_user(유저.id)
@@ -1085,6 +1139,66 @@ def change_str(price, base):
     if abs(pct) < 0.005:
         return "(0.00%)"
     return f"{'🔺' if pct > 0 else '🔻'}{abs(pct):.2f}%"
+
+
+def render_chart(points, ref, mode):
+    """
+    주가/지수 추이 PNG (BytesIO). matplotlib 가 없으면 None → 텍스트 스파크라인으로 대체.
+    한국식 색상: 기준가보다 높으면 빨강, 낮으면 파랑. 한글 폰트 의존을 피하려고 그림엔 숫자만 넣는다.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        from matplotlib.figure import Figure
+        import matplotlib.dates as mdates
+        from matplotlib.ticker import FuncFormatter
+    except ImportError:
+        return None
+    if not points:
+        return None
+    if len(points) == 1:
+        points = [(points[0][0] - 600, points[0][1])] + list(points)
+
+    xs = [datetime.fromtimestamp(t, KST) for t, _ in points]
+    ys = [v for _, v in points]
+    up = ys[-1] >= ref
+    color = "#f04452" if up else "#3182f6"
+    bg, fg, grid = "#2b2d31", "#dbdee1", "#4e5058"
+
+    fig = Figure(figsize=(8, 3.6), dpi=110)
+    fig.patch.set_facecolor(bg)
+    ax = fig.subplots()
+    ax.set_facecolor(bg)
+    lo, hi = min(ys + [ref]), max(ys + [ref])
+    pad = (hi - lo) * 0.12 or max(abs(hi) * 0.01, 1)
+    ax.set_ylim(lo - pad, hi + pad)
+    ax.plot(xs, ys, color=color, linewidth=2)
+    ax.fill_between(xs, ys, lo - pad, color=color, alpha=0.12)
+    ax.axhline(ref, color="#949ba4", linestyle="--", linewidth=1)
+
+    num = (lambda v: f"{v:,.2f}") if mode == "INDEX" else (lambda v: f"{v:,.0f}")
+    i_hi, i_lo = ys.index(max(ys)), ys.index(min(ys))
+    ax.annotate(f"H {num(ys[i_hi])}", (xs[i_hi], ys[i_hi]), textcoords="offset points", xytext=(0, 6),
+                ha="center", color="#f04452", fontsize=8)
+    ax.annotate(f"L {num(ys[i_lo])}", (xs[i_lo], ys[i_lo]), textcoords="offset points", xytext=(0, -12),
+                ha="center", color="#3182f6", fontsize=8)
+    ax.scatter([xs[-1]], [ys[-1]], color=color, s=25, zorder=3)
+    ax.annotate(num(ys[-1]), (xs[-1], ys[-1]), textcoords="offset points", xytext=(6, 0),
+                va="center", color=color, fontsize=9, fontweight="bold")
+
+    span = points[-1][0] - points[0][0]
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M" if span <= 36 * 3600 else "%m/%d %H:00", tz=KST))
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: num(v)))
+    ax.tick_params(colors=fg, labelsize=8)
+    for sp in ax.spines.values():
+        sp.set_visible(False)
+    ax.grid(True, color=grid, alpha=0.5, linewidth=0.6)
+    ax.margins(x=0.06)
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight", facecolor=bg)
+    buf.seek(0)
+    return buf
 
 
 def sparkline(values, width=24):
